@@ -1,0 +1,19 @@
+[package]
+name = "ecsn"
+description = "Embedded Compact State Node: a Utreexo node over floresta-chain, for microcontrollers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+floresta-chain.workspace = true
+rustreexo.workspace = true
+embedded-io-async.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `floresta-chain` is also a `cdylib`, which links on the host only with `std`
+floresta-chain = { workspace = true, features = ["std"] }

@@ -1,0 +1,19 @@
+[package]
+name = "ecsn-host"
+description = "The ECSN node on a computer, over TCP, to develop and test it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ecsn.workspace = true
+bitcoin = { workspace = true, features = ["std"] }
+floresta-chain = { workspace = true, features = ["std"] }
+rustreexo = { workspace = true, features = ["std"] }
+embedded-io-adapters = { version = "0.6", features = ["tokio-1"] }
+tokio = { version = "1", features = ["rt", "net", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
