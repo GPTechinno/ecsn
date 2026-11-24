@@ -18,7 +18,7 @@ bitcoin = { version = "0.32.8", default-features = false }
 floresta-chain = { path = "../../bitcoin/Floresta/crates/floresta-chain", default-features = false }
 tracing = { version = "0.1", default-features = false }
 
-embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h747xi-cm7", "time-driver-any", "exti"] }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h747xi-cm7", "time-driver-any", "exti", "unstable-pac"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet"] }

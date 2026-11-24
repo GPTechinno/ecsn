@@ -2,76 +2,16 @@
 //! their coinbase alone, then block 111, whose transactions spend six coinbase outputs of
 //! earlier blocks with their Utreexo proof, and the accumulator utreexod has after it.
 
-use bitcoin::consensus::encode::{deserialize_hex, Decodable, VarInt};
-use bitcoin::{Block, Network};
+mod common;
+
+use bitcoin::Network;
+use common::{fixture, Fixture};
 use ecsn::node::{Config, Node};
 use ecsn::store::MemChainStore;
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
-use floresta_chain::{BlockchainInterface, CompactLeafData, ScriptPubKeyKind};
+use floresta_chain::{BlockchainInterface, CompactLeafData};
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
-
-struct Fixture {
-    blocks: Vec<Block>,
-    leaf_data: Vec<CompactLeafData>,
-    proof: Proof,
-    leaves: u64,
-    roots: Vec<String>,
-}
-
-/// BIP 183's serialized Utreexo data: targets, proof hashes, then the spent outputs.
-fn udata(hex: &str) -> (Vec<CompactLeafData>, Proof) {
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-        .collect();
-    let r = &mut &bytes[..];
-    let n = VarInt::consensus_decode(r).unwrap().0;
-    let targets = (0..n)
-        .map(|_| VarInt::consensus_decode(r).unwrap().0)
-        .collect();
-    let n = VarInt::consensus_decode(r).unwrap().0;
-    let hashes = (0..n)
-        .map(|_| BitcoinNodeHash::Some(<[u8; 32]>::consensus_decode(r).unwrap()))
-        .collect();
-    let n = VarInt::consensus_decode(r).unwrap().0;
-    let leaf_data = (0..n)
-        .map(|_| CompactLeafData {
-            header_code: u32::consensus_decode(r).unwrap(),
-            amount: u64::consensus_decode(r).unwrap(),
-            spk_ty: ScriptPubKeyKind::consensus_decode(r).unwrap(),
-        })
-        .collect();
-    assert!(r.is_empty());
-    (leaf_data, Proof { targets, hashes })
-}
-
-fn fixture() -> Fixture {
-    let mut blocks = Vec::new();
-    let mut proof = None;
-    let mut acc = None;
-    for line in include_str!("data/regtest-111.txt").lines() {
-        match line.split_once(' ') {
-            Some(("block", hex)) => blocks.push(deserialize_hex(hex).unwrap()),
-            Some(("udata", hex)) => proof = Some(udata(hex)),
-            Some(("acc", rest)) => {
-                let mut words = rest.split_whitespace();
-                let leaves = words.next().unwrap().parse().unwrap();
-                acc = Some((leaves, words.map(String::from).collect()));
-            }
-            _ => {}
-        }
-    }
-    let (leaf_data, proof) = proof.unwrap();
-    let (leaves, roots) = acc.unwrap();
-    Fixture {
-        blocks,
-        leaf_data,
-        proof,
-        leaves,
-        roots,
-    }
-}
 
 /// A node with every header, and every block validated up to 110.
 fn node_at_110(fixture: &Fixture) -> Node<MemChainStore> {

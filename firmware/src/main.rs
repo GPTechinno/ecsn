@@ -1,11 +1,13 @@
 //! The ECSN node on an STM32H747I-DISCO (Cortex-M7 core): 400 MHz, the 32 MB SDRAM as the heap,
 //! Ethernet with DHCP, then the node of `ecsn` against one peer, reconnecting when the connection
-//! ends. The chain stays in RAM across connections and is lost on reset.
+//! ends. The chain is kept on the 128 MB QSPI flash, formatted at the first start (which erases
+//! what the flash holds, in a few minutes).
 //!
 //! Set at build time:
 //! - `ECSN_PEER` (required): the peer, `ip:port`, for example `192.168.1.10:18444`;
 //! - `ECSN_NETWORK`: `bitcoin`, `testnet`, `testnet4`, `signet` or `regtest` (the default);
 //! - `ECSN_ASSUME_UTREEXO`: set to start from `floresta-chain`'s accumulator of the network;
+//! - `ECSN_RAM_STORE`: set to keep the chain in RAM instead, lost on reset;
 //! - `ECSN_LOG`: the most detailed log level of the node (`info` by default).
 //!
 //! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to the peer.
@@ -19,6 +21,8 @@
 extern crate alloc;
 
 mod log;
+mod mpu;
+mod qspi;
 mod sdram;
 
 use core::mem::MaybeUninit;
@@ -29,10 +33,10 @@ use bitcoin::Network;
 use defmt::{error, info, unwrap, warn, Debug2Format};
 use ecsn::node::{Config, Node};
 use ecsn::p2p::Connection;
-use ecsn::store::MemChainStore;
+use ecsn::store::{FlashChainStore, MemChainStore};
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::StackResources;
+use embassy_net::{Stack, StackResources};
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::fmc::Fmc;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -41,7 +45,7 @@ use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::{bind_interrupts, eth, peripherals, SharedData};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_alloc::TlsfHeap;
-use floresta_chain::{BlockchainInterface, ChainParams};
+use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
 use static_cell::StaticCell;
 use stm32_fmc::devices::is42s32800g_6::Is42s32800g;
 use {defmt_rtt as _, panic_probe as _};
@@ -64,6 +68,7 @@ const PEER: &str = env!(
 );
 const NETWORK: Option<&str> = option_env!("ECSN_NETWORK");
 const ASSUME_UTREEXO: bool = option_env!("ECSN_ASSUME_UTREEXO").is_some();
+const RAM_STORE: bool = option_env!("ECSN_RAM_STORE").is_some();
 /// The board has no clock set: the build's time, close enough for the peer's time offset.
 const BUILD_TIME: &str = env!("ECSN_BUILD_TIME");
 
@@ -127,10 +132,10 @@ async fn main(spawner: Spawner) {
     core.SCB.enable_icache();
 
     spawner.spawn(unwrap!(blink(Output::new(p.PI12, Level::High, Speed::Low))));
-    let mut connected = Output::new(p.PI13, Level::High, Speed::Low);
+    let connected = Output::new(p.PI13, Level::High, Speed::Low);
 
     // SDRAM, then the heap in it
-    sdram::map(&mut core.MPU, &mut core.SCB);
+    mpu::configure(&mut core.MPU, &mut core.SCB);
     let mut sdram = Fmc::sdram_a12bits_d32bits_4banks_bank2(
         p.FMC,
         // A0..A11
@@ -257,11 +262,58 @@ async fn main(spawner: Spawner) {
         user_agent: concat!("/ecsn:", env!("CARGO_PKG_VERSION"), "/").into(),
         assume_utreexo: ASSUME_UTREEXO.then(|| ChainParams::get_assume_utreexo(network)),
     };
-    let node = match Node::new(MemChainStore::new(), config, nonce) {
+    let now: i64 = BUILD_TIME.parse().unwrap_or(0);
+    if RAM_STORE {
+        info!("chain store: RAM");
+        follow(
+            stack,
+            MemChainStore::new(),
+            config,
+            nonce,
+            peer,
+            now,
+            connected,
+        )
+        .await
+    }
+
+    let flash = match qspi::QspiFlash::new(
+        p.QUADSPI, p.PB2, p.PG6, p.PD11, p.PF9, p.PF7, p.PF6, p.PH2, p.PH3, p.PG9, p.PG14,
+    ) {
+        Ok(flash) => flash,
+        Err(e) => defmt::panic!("QSPI flash: {}", e),
+    };
+    info!("QSPI flash: mounting the chain store (formatting a flash without one takes minutes)");
+    let store = match FlashChainStore::mount(flash, network, true) {
+        Ok((store, formatted)) => {
+            info!(
+                "QSPI flash: {=str}, {=u32} headers stored, room for {=u32}",
+                if formatted { "formatted" } else { "mounted" },
+                store.records(),
+                store.layout().records
+            );
+            store
+        }
+        Err(e) => defmt::panic!("QSPI flash: {}", Debug2Format(&e)),
+    };
+    follow(stack, store, config, nonce, peer, now, connected).await
+}
+
+/// Runs the node on `store` against the peer, reconnecting when the connection ends.
+async fn follow<S: ChainStore>(
+    stack: Stack<'static>,
+    store: S,
+    config: Config,
+    nonce: u64,
+    peer: SocketAddrV4,
+    now: i64,
+    mut connected: Output<'static>,
+) -> ! {
+    let network = config.network;
+    let node = match Node::new(store, config, nonce) {
         Ok(node) => node,
         Err(e) => defmt::panic!("chain: {}", Debug2Format(&e)),
     };
-    let now: i64 = BUILD_TIME.parse().unwrap_or(0);
 
     static RX: StaticCell<[u8; 32 * 1024]> = StaticCell::new();
     static TX: StaticCell<[u8; 8 * 1024]> = StaticCell::new();

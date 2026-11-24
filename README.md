@@ -14,10 +14,10 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 
 | Crate | |
 |---|---|
-| `ecsn` | `no_std`: the P2P messages (v1 transport, BIP 183's `getuproof`/`uproof`), a chain store in RAM, the node (handshake, header sync, block validation, following new blocks) over any `embedded-io-async` stream |
-| `ecsn-host` | the node over TCP on a computer (tokio) |
+| `ecsn` | `no_std`: the P2P messages (v1 transport, BIP 183's `getuproof`/`uproof`), chain stores in RAM and on NOR flash, the node (handshake, header sync, block validation, following new blocks) over any `embedded-io-async` stream |
+| `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file |
 | `ecsn-regtest` | fills a regtest node with blocks spending outputs of earlier blocks and of their own |
-| `ecsn-firmware` (`firmware/`) | the node on an STM32H747I-DISCO (Cortex-M7): embassy, Ethernet with DHCP, the 32 MB SDRAM as the heap. Its own workspace, built from its directory |
+| `ecsn-firmware` (`firmware/`) | the node on an STM32H747I-DISCO (Cortex-M7): embassy, Ethernet with DHCP, the 32 MB SDRAM as the heap, the chain on the 128 MB QSPI flash. Its own workspace, built from its directory |
 
 `floresta-chain` comes by path from `../bitcoin/Floresta`, branch `floresta-chain-no-std`, which builds it
 without `std` (getfloresta/Floresta#1498).
@@ -50,8 +50,29 @@ ecsn-host --network regtest            # or --follow to keep following new block
 prints the validated tip and its accumulator; utreexod's `getutreexoroots <hash>` gives its own
 to compare.
 
+With `--store <file>`, `ecsn-host` keeps the chain in the flash chain store, in a file holding the
+image of a NOR flash (created erased, 128 MiB by default, `--store-size`). A later run on the same
+file starts from what it holds.
+
 `ecsn/tests/data/regtest-111.txt` is such a chain recorded from utreexod (blocks 1 to 111, block
 111's Utreexo data and the accumulator after it), which the tests validate and tamper with.
+
+## The flash chain store
+
+`ecsn::store::FlashChainStore` keeps the chain on NOR flash (`ecsn::flash::Flash`: reads, programs
+that only clear bits, erases of whole blocks):
+
+- header records (88 bytes: the header, its height and a commit mark), appended;
+- a hash table from block hashes to records and an index from heights to records, both made of
+  slots written once;
+- a journal of the best chain, the index entries changed by reorgs and the headers marked
+  invalid, in two banks used in turn;
+- the accumulators of the latest blocks, in a ring of erase blocks.
+
+The state of each header (valid, header only, in a fork) is kept in RAM and, after a reset,
+follows from the index and the best chain. 128 MB hold 1,353,193 headers. A power cut at any
+point leaves a store that mounts and resumes (`ecsn/tests/flash_store.rs` cuts the power at
+every 17th programmed byte of a run, in `ecsn::flash::RamFlash`).
 
 ## On the STM32H747I-DISCO
 
@@ -67,6 +88,7 @@ Optional build-time settings:
 
 - `ECSN_NETWORK`: `regtest` by default.
 - `ECSN_ASSUME_UTREEXO`: set it to start from `floresta-chain`'s accumulator.
+- `ECSN_RAM_STORE`: set it to keep the chain in RAM instead of on the QSPI flash.
 - `ECSN_LOG`: the log level, `info` by default.
 
 The peer must accept the board's connection: run utreexod with `--listen` on a LAN address, not
@@ -77,13 +99,17 @@ The board's Ethernet needs a hardware change. With the default solder bridges, P
 ETH_MDC and SAI4_D1 of the digital microphones (UM2411). Zephyr's documentation of the board
 gives the change: open SB21, SB45 and R87, and close SB22, SB44, SB17 and SB8.
 
-The chain is kept in RAM: the headers, and an accumulator per block. That is enough for regtest.
-Signet's and mainnet's headers alone outgrow the 32 MB SDRAM.
+The chain is kept on the QSPI flash: two MT25QL512 in dual-flash mode, one 128 MB flash read
+through the memory map. The first start formats it, which erases what it holds (ST's demonstration
+data among it) and takes up to a few minutes.
 
 ## Status
 
 - Checked on regtest against utreexod 0.6.0: 123 blocks, the accumulator identical to
   utreexod's; new blocks followed; changed proof hashes, amounts, heights, targets and missing
   leaves refused.
-- One block at a time, one peer, the v1 transport (no BIP 324), no mempool, no script check,
-  headers and accumulators in RAM.
+- The flash chain store, in a flash image: synced, restarted (only the new blocks validated),
+  reorged by utreexod (`invalidateblock`) and restarted again, the accumulator identical to
+  utreexod's at each step.
+- One block at a time, one peer, the v1 transport (no BIP 324), no mempool, no script check.
+- The firmware builds; it has not run on a board yet.
