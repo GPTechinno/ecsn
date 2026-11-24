@@ -46,6 +46,10 @@ ecsn-regtest fill --blocks 10 --pairs 4
 ecsn-host --network regtest            # or --follow to keep following new blocks
 ```
 
+While syncing, the node asks for `--blocks-in-flight` blocks at once (16 by default, 4 on the
+board), the proof of each as it comes, and validates them in order; it flushes the chain every
+100 blocks.
+
 (`--configfile` naming an empty file keeps utreexod from creating `~/.utreexod`.) `ecsn-host`
 prints the validated tip and its accumulator; utreexod's `getutreexoroots <hash>` gives its own
 to compare.
@@ -111,5 +115,8 @@ data among it) and takes up to a few minutes.
 - The flash chain store, in a flash image: synced, restarted (only the new blocks validated),
   reorged by utreexod (`invalidateblock`) and restarted again, the accumulator identical to
   utreexod's at each step.
-- One block at a time, one peer, the v1 transport (no BIP 324), no mempool, no script check.
+- Blocks pipelined: windows of 1 and 16 give utreexod's accumulator on 150 regtest blocks; the
+  tests also check blocks sent in reverse (`ecsn/tests/sync.rs`, a peer answering from the
+  fixture).
+- One peer, the v1 transport (no BIP 324), no mempool, no script check.
 - The firmware builds; it has not run on a board yet.

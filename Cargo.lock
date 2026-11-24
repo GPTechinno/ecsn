@@ -299,9 +299,11 @@ name = "ecsn"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "embedded-io-adapters",
  "embedded-io-async",
  "floresta-chain",
  "rustreexo",
+ "tokio",
  "tracing",
 ]
 

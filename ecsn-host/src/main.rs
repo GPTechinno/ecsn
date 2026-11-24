@@ -43,6 +43,9 @@ struct Args {
     /// The size of a new `--store` flash image, in MiB
     #[arg(long, default_value_t = 128)]
     store_size: u32,
+    /// Blocks asked for at once while syncing
+    #[arg(long, default_value_t = 16)]
+    blocks_in_flight: usize,
 }
 
 fn default_port(network: Network) -> u16 {
@@ -68,6 +71,7 @@ async fn main() -> ExitCode {
         assume_utreexo: args
             .assume_utreexo
             .then(|| ChainParams::get_assume_utreexo(args.network)),
+        blocks_in_flight: args.blocks_in_flight,
     };
 
     let Some(path) = &args.store else {

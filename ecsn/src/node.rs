@@ -1,12 +1,12 @@
 //! The node: handshake with a peer, header sync, then each block validated with its Utreexo
-//! proof (`floresta-chain`), one block at a time.
+//! proof (`floresta-chain`), in order, with several blocks asked for at once.
 //!
 //! Scripts are not checked (`floresta-chain` without `bitcoinkernel`): a block is accepted on
 //! its proof of work, its structure, its Utreexo proof, the amounts and the other rules
 //! `floresta-chain` checks.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use bitcoin::hashes::Hash;
@@ -35,6 +35,25 @@ pub struct Config {
     pub user_agent: String,
     /// An accumulator to start from, taken as valid once its block is in the best header chain.
     pub assume_utreexo: Option<AssumeUtreexoValue>,
+    /// Blocks asked for at once while syncing. Each is held until it is validated: up to a few
+    /// megabytes on mainnet.
+    pub blocks_in_flight: usize,
+}
+
+/// Validated blocks between two flushes of the chain while syncing, so that a reset loses
+/// little of a long sync.
+const FLUSH_EVERY: u32 = 100;
+/// Validated heights between two progress lines while syncing.
+const PROGRESS_EVERY: u32 = 1000;
+
+/// A block asked for, until it is validated.
+struct InFlight {
+    height: u32,
+    hash: BlockHash,
+    block: Option<Block>,
+    /// The outputs the block spends and their proof: asked for once the block is here, empty at
+    /// once for a block of its coinbase alone.
+    proof: Option<(Vec<CompactLeafData>, Proof)>,
 }
 
 /// What can stop the node.
@@ -179,60 +198,115 @@ impl<S: ChainStore> Node<S> {
     }
 
     /// Downloads and validates every block after the last validated one, up to the best header.
-    /// Returns the height of the last validated block.
+    /// Up to [`Config::blocks_in_flight`] blocks are asked for at once, the proof of each as it
+    /// comes, and they are validated in order whatever order they come in. Returns the height
+    /// of the last validated block.
     pub async fn sync_blocks<T: Read + Write>(
         &self,
         conn: &mut Connection<T>,
     ) -> Result<u32, Error<T::Error>> {
+        let window = self.config.blocks_in_flight.max(1);
+        let (best, _) = self.chain.get_best_block()?;
+        let mut asked = self.chain.get_validation_index()?;
+        let mut in_flight: VecDeque<InFlight> = VecDeque::new();
+        let mut validated = 0;
         loop {
-            let (best, _) = self.chain.get_best_block()?;
-            let height = self.chain.get_validation_index()? + 1;
-            if height > best {
+            let mut inventory = Vec::new();
+            while asked < best && in_flight.len() < window {
+                asked += 1;
+                let hash = self.chain.get_block_hash(asked)?;
+                inventory.push(Inventory::witness_block(hash));
+                in_flight.push_back(InFlight {
+                    height: asked,
+                    hash,
+                    block: None,
+                    proof: None,
+                });
+            }
+            if !inventory.is_empty() {
+                conn.send(&Message::GetData(inventory)).await?;
+            }
+
+            let mut progress = false;
+            while in_flight
+                .front()
+                .is_some_and(|b| b.block.is_some() && b.proof.is_some())
+            {
+                let Some(InFlight {
+                    height,
+                    hash,
+                    block: Some(block),
+                    proof: Some((leaf_data, proof)),
+                }) = in_flight.pop_front()
+                else {
+                    break;
+                };
+                block
+                    .check_block_structure()
+                    .map_err(BlockchainError::from)?;
+                self.connect_block(height, &block, &leaf_data, proof)?;
+                debug!(
+                    "block {height} {hash}: {} transactions, {} inputs proven",
+                    block.txdata.len(),
+                    leaf_data.len()
+                );
+                validated += 1;
+                progress = true;
+                if validated % FLUSH_EVERY == 0 {
+                    self.chain.flush()?;
+                }
+                if height % PROGRESS_EVERY == 0 {
+                    info!("validated up to {height} of {best}");
+                }
+            }
+            if in_flight.is_empty() && asked >= best {
                 return Ok(best);
             }
-            let hash = self.chain.get_block_hash(height)?;
+            if progress {
+                // ask for more before waiting
+                continue;
+            }
 
-            conn.send(&Message::GetData(vec![Inventory::witness_block(hash)]))
-                .await?;
-            let block = loop {
-                match next(conn).await? {
-                    Message::Block(block) if block.block_hash() == hash => break block,
-                    Message::NotFound(list) if list.iter().any(|i| i.block() == Some(hash)) => {
-                        return Err(Error::NotFound(hash))
+            match next(conn).await? {
+                Message::Block(block) => {
+                    let hash = block.block_hash();
+                    let Some(slot) = in_flight
+                        .iter_mut()
+                        .find(|b| b.hash == hash && b.block.is_none())
+                    else {
+                        continue;
+                    };
+                    // a block of its coinbase alone spends nothing
+                    if block.txdata.len() > 1 {
+                        conn.send(&Message::GetUtreexoProof(GetUtreexoProof::all(hash)))
+                            .await?;
+                    } else {
+                        slot.proof = Some((Vec::new(), Proof::default()));
                     }
-                    _ => {}
+                    slot.block = Some(block);
                 }
-            };
-            block
-                .check_block_structure()
-                .map_err(BlockchainError::from)?;
-
-            // a block of its coinbase alone spends nothing
-            let (leaf_data, proof) = if block.txdata.len() > 1 {
-                conn.send(&Message::GetUtreexoProof(GetUtreexoProof::all(hash)))
-                    .await?;
-                let uproof = loop {
-                    if let Message::UtreexoProof(uproof) = next(conn).await? {
-                        if uproof.block_hash == hash {
-                            break uproof;
-                        }
+                Message::UtreexoProof(uproof) => {
+                    if let Some(slot) = in_flight.iter_mut().find(|b| {
+                        b.hash == uproof.block_hash && b.block.is_some() && b.proof.is_none()
+                    }) {
+                        let proof = Proof {
+                            hashes: uproof.proof_hashes,
+                            targets: uproof.targets,
+                        };
+                        slot.proof = Some((uproof.leaf_data, proof));
                     }
-                };
-                let proof = Proof {
-                    hashes: uproof.proof_hashes,
-                    targets: uproof.targets,
-                };
-                (uproof.leaf_data, proof)
-            } else {
-                (Vec::new(), Proof::default())
-            };
-
-            self.connect_block(height, &block, &leaf_data, proof)?;
-            debug!(
-                "block {height} {hash}: {} transactions, {} inputs proven",
-                block.txdata.len(),
-                leaf_data.len()
-            );
+                }
+                Message::NotFound(list) => {
+                    if let Some(hash) = list
+                        .iter()
+                        .filter_map(Inventory::block)
+                        .find(|h| in_flight.iter().any(|b| b.hash == *h))
+                    {
+                        return Err(Error::NotFound(hash));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

@@ -62,6 +62,7 @@ fn config() -> Config {
         network: Network::Regtest,
         user_agent: String::new(),
         assume_utreexo: None,
+        blocks_in_flight: 1,
     }
 }
 

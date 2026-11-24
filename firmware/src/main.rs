@@ -8,6 +8,8 @@
 //! - `ECSN_NETWORK`: `bitcoin`, `testnet`, `testnet4`, `signet` or `regtest` (the default);
 //! - `ECSN_ASSUME_UTREEXO`: set to start from `floresta-chain`'s accumulator of the network;
 //! - `ECSN_RAM_STORE`: set to keep the chain in RAM instead, lost on reset;
+//! - `ECSN_BLOCKS_IN_FLIGHT`: blocks asked for at once while syncing, 4 by default (each is held
+//!   in RAM until validated, up to a few megabytes on mainnet);
 //! - `ECSN_LOG`: the most detailed log level of the node (`info` by default).
 //!
 //! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to the peer.
@@ -69,6 +71,7 @@ const PEER: &str = env!(
 const NETWORK: Option<&str> = option_env!("ECSN_NETWORK");
 const ASSUME_UTREEXO: bool = option_env!("ECSN_ASSUME_UTREEXO").is_some();
 const RAM_STORE: bool = option_env!("ECSN_RAM_STORE").is_some();
+const BLOCKS_IN_FLIGHT: Option<&str> = option_env!("ECSN_BLOCKS_IN_FLIGHT");
 /// The board has no clock set: the build's time, close enough for the peer's time offset.
 const BUILD_TIME: &str = env!("ECSN_BUILD_TIME");
 
@@ -261,6 +264,11 @@ async fn main(spawner: Spawner) {
         network,
         user_agent: concat!("/ecsn:", env!("CARGO_PKG_VERSION"), "/").into(),
         assume_utreexo: ASSUME_UTREEXO.then(|| ChainParams::get_assume_utreexo(network)),
+        blocks_in_flight: match BLOCKS_IN_FLIGHT.map(str::parse) {
+            None => 4,
+            Some(Ok(n)) => n,
+            Some(Err(_)) => defmt::panic!("ECSN_BLOCKS_IN_FLIGHT: not a number"),
+        },
     };
     let now: i64 = BUILD_TIME.parse().unwrap_or(0);
     if RAM_STORE {

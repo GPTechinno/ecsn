@@ -17,3 +17,5 @@ tracing.workspace = true
 [dev-dependencies]
 # `floresta-chain` is also a `cdylib`, which links on the host only with `std`
 floresta-chain = { workspace = true, features = ["std"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
