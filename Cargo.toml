@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["ecsn", "ecsn-host", "ecsn-regtest"]
+# The firmware targets thumbv7em-none-eabihf with its own profile, runner and lockfile (see
+# firmware/.cargo/config.toml), so it is built from its own directory, outside of this host workspace.
+exclude = ["firmware"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +17,7 @@ bitcoin = { version = "0.32.8", default-features = false }
 # `bitcoin/Floresta` on its branch `floresta-chain-no-std` (getfloresta/Floresta#1498)
 floresta-chain = { path = "../bitcoin/Floresta/crates/floresta-chain", default-features = false }
 rustreexo = { version = "=0.7.0", default-features = false }
-embedded-io-async = "0.6"
+embedded-io-async = "0.7"
 tracing = { version = "0.1", default-features = false }
 
 ecsn = { path = "ecsn" }

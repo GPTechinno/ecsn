@@ -1,0 +1,14 @@
+[target.thumbv7em-none-eabihf]
+runner = [
+  "probe-rs",
+  "run",
+  "--chip",
+  "STM32H747XIHx",
+  "--log-format={{t:dimmed} [{L:bold}]} {s}  {{c} {ff}:{l:1}%dimmed}",
+]
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+DEFMT_LOG = "info"
