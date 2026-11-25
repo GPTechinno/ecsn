@@ -1,0 +1,30 @@
+[package]
+name = "ecsn-emu-disco"
+description = "The STM32H747I-DISCO emulated, to run and debug the ECSN firmware: the STM32H7 of stm32h7-rax with the board's SDRAM, QSPI flash, Ethernet PHY and LEDs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Georges Palauqui <g.palauqui@gptechinno.com>"]
+publish = false
+
+# Its own workspace: BLIT, its window, needs nightly Rust (rust-toolchain.toml).
+[workspace]
+
+[dependencies]
+stm32h7-rax = { path = "../../emulator/stm32h7-rax" }
+# its network: a router with DHCP, DNS and NAT to the host
+esp32s3-rax = { path = "../../emulator/esp32s3-rax" }
+defmt-decoder = "1.2"
+goblin = "0.10"
+rustc-demangle = "0.1"
+ctrlc = { version = "3", features = ["termination"] }
+clap = { version = "4", features = ["derive"] }
+blit = { git = "https://github.com/nicoburniske/blit", rev = "cf322c08a43892ea813deb8c8cadd86a43d5f2c0" }
+blit-desktop = { git = "https://github.com/nicoburniske/blit", rev = "cf322c08a43892ea813deb8c8cadd86a43d5f2c0", default-features = false, features = ["cpu"] }
+blit-gui = { git = "https://github.com/nicoburniske/blit", rev = "cf322c08a43892ea813deb8c8cadd86a43d5f2c0" }
+blit-gui-widgets = { git = "https://github.com/nicoburniske/blit", rev = "cf322c08a43892ea813deb8c8cadd86a43d5f2c0" }
+blit-text = { git = "https://github.com/nicoburniske/blit", rev = "cf322c08a43892ea813deb8c8cadd86a43d5f2c0" }
+blit-text-parley = { git = "https://github.com/nicoburniske/blit", rev = "cf322c08a43892ea813deb8c8cadd86a43d5f2c0" }
+
+[profile.release]
+debug = 1

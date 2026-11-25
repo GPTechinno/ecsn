@@ -3,7 +3,8 @@ resolver = "2"
 members = ["ecsn", "ecsn-host", "ecsn-regtest"]
 # The firmware targets thumbv7em-none-eabihf with its own profile, runner and lockfile (see
 # firmware/.cargo/config.toml), so it is built from its own directory, outside of this host workspace.
-exclude = ["firmware"]
+# ecsn-emu-disco builds with the nightly Rust of BLIT, its window (see ecsn-emu-disco/rust-toolchain.toml).
+exclude = ["firmware", "ecsn-emu-disco"]
 
 [workspace.package]
 version = "0.1.0"

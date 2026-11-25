@@ -17,6 +17,7 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 | `ecsn` | `no_std`: the P2P messages (v1 transport, BIP 183's `getuproof`/`uproof`), chain stores in RAM and on NOR flash, the node (handshake, header sync, block validation, following new blocks) over any `embedded-io-async` stream |
 | `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file |
 | `ecsn-regtest` | fills a regtest node with blocks spending outputs of earlier blocks and of their own |
+| `ecsn-emu-disco` | the STM32H747I-DISCO emulated (`emulator/stm32h7-rax` with the board around it), to run and debug the firmware: a BLIT window or headless. Its own workspace, built from its directory with BLIT's nightly Rust |
 | `ecsn-firmware` (`firmware/`) | the node on an STM32H747I-DISCO (Cortex-M7): embassy, Ethernet with DHCP, the 32 MB SDRAM as the heap, the chain on the 128 MB QSPI flash. Its own workspace, built from its directory |
 
 `floresta-chain` comes by path from `../bitcoin/Floresta`, branch `floresta-chain-no-std`, which builds it
@@ -107,6 +108,29 @@ The chain is kept on the QSPI flash: two MT25QL512 in dual-flash mode, one 128 M
 through the memory map. The first start formats it, which erases what it holds (ST's demonstration
 data among it) and takes up to a few minutes.
 
+## The emulated board
+
+`ecsn-emu-disco` runs the firmware's ELF on the STM32H7 of `../emulator/stm32h7-rax` with the
+DISCO's 32 MB SDRAM, its two MT25QL512 (128 MB in dual-flash mode, kept in a file across runs with
+`--qspi`), its LAN8742A and a network behind it: esp32s3-rax's router, with DHCP, DNS and NAT, where
+the gateway 10.0.2.2 is the host's 127.0.0.1. The firmware is built with that peer:
+
+```
+cd firmware && ECSN_PEER=10.0.2.2:18444 cargo build --release    # utreexod on the host, port 18444
+cd ../ecsn-emu-disco && cargo run --release -- --qspi /tmp/disco.img             # the window
+cargo run --release -- --headless --seconds 30 --realtime --qspi /tmp/disco.img  # logs on stdout
+```
+
+The window shows the four LEDs, the address, the validated tip, the pace and a RESET button next to
+the decoded defmt logs. Headless: `--realtime` keeps virtual time no faster than the wall clock (for
+real peers; a board fallen behind, its core busy, does not catch up), `--profile SECONDS` samples
+the PC every millisecond and prints the busiest functions with their callers for each interval of
+that many seconds, and for the whole run at the end, `--trace` prints the PC and the core clock
+every millisecond, `--mmio-trace start:end` every peripheral access in a range. Ctrl-C (or SIGTERM)
+ends a headless run as `--seconds` does: the statistics, the profile, the QSPI image saved.
+`ECSN_LOG=debug DEFMT_LOG=debug` at the firmware's build gives the node's debug logs. Its devenv
+(nightly Rust from `rust-toolchain.toml`, the fonts, the Wayland libraries) is its own.
+
 ## Status
 
 - Checked on regtest against utreexod 0.6.0: 123 blocks, the accumulator identical to
@@ -119,4 +143,10 @@ data among it) and takes up to a few minutes.
   tests also check blocks sent in reverse (`ecsn/tests/sync.rs`, a peer answering from the
   fixture).
 - One peer, the v1 transport (no BIP 324), no mempool, no script check.
-- The firmware builds; it has not run on a board yet.
+- The firmware runs on the emulated board (not yet on a real one): SDRAM, Ethernet with DHCP, the
+  chain store formatted and mounted on the QSPI flash, synced and following utreexod, restarted and
+  reorged; and on signet with assume-utreexo, from an erased flash to the tip, through the public
+  peer. The emulator found four bugs of the node, fixed with their tests: an early header
+  announcement taken for the answer to `getheaders`, a block announced during a sync forgotten, a
+  reset during the header sync forcing a reindex of the whole chain, and a header sync idling
+  between batches (now pipelined, 5 times faster on the board).

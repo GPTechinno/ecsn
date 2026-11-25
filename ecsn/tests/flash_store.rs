@@ -3,12 +3,9 @@
 
 mod common;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use bitcoin::{BlockHash, Network};
-use common::{fixture, Fixture};
-use ecsn::flash::{Flash, RamFlash, RamFlashError};
+use common::{fixture, Fixture, Shared};
+use ecsn::flash::{Flash, RamFlash};
 use ecsn::node::{Config, Node};
 use ecsn::store::{FlashChainStore, Layout, MemChainStore, RECORD_SIZE};
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
@@ -18,44 +15,6 @@ use floresta_chain::{
 use rustreexo::proof::Proof;
 
 const CAPACITY: u32 = 4 << 20;
-
-/// A flash the test keeps a handle on while a node owns the store.
-#[derive(Clone)]
-struct Shared(Rc<RefCell<RamFlash>>);
-
-impl Shared {
-    fn new(capacity: u32) -> Self {
-        Self(Rc::new(RefCell::new(RamFlash::new(capacity))))
-    }
-
-    /// The flash after a reset now: a copy of what is programmed.
-    fn reset(&self) -> Self {
-        let bytes = self.0.borrow().bytes().to_vec();
-        Self(Rc::new(RefCell::new(RamFlash::from_bytes(bytes))))
-    }
-}
-
-impl Flash for Shared {
-    type Error = RamFlashError;
-    const ERASE_SIZE: u32 = RamFlash::ERASE_SIZE;
-    const WRITE_SIZE: u32 = RamFlash::WRITE_SIZE;
-
-    fn capacity(&self) -> u32 {
-        self.0.borrow().capacity()
-    }
-
-    fn read(&self, offset: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
-        self.0.borrow().read(offset, buf)
-    }
-
-    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), Self::Error> {
-        self.0.borrow_mut().write(offset, data)
-    }
-
-    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        self.0.borrow_mut().erase(from, to)
-    }
-}
 
 fn config() -> Config {
     Config {

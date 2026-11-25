@@ -5,8 +5,14 @@
 // each test crate uses part of it
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use bitcoin::block::{Header, Version};
 use bitcoin::consensus::encode::{deserialize_hex, Decodable, VarInt};
-use bitcoin::Block;
+use bitcoin::hashes::Hash;
+use bitcoin::{Block, TxMerkleNode};
+use ecsn::flash::{Flash, RamFlash, RamFlashError};
 use floresta_chain::{CompactLeafData, ScriptPubKeyKind};
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
@@ -71,4 +77,64 @@ pub fn fixture() -> Fixture {
         leaves,
         roots,
     }
+}
+
+/// A flash the test keeps a handle on while a node owns the store.
+#[derive(Clone)]
+pub struct Shared(Rc<RefCell<RamFlash>>);
+
+impl Shared {
+    pub fn new(capacity: u32) -> Self {
+        Self(Rc::new(RefCell::new(RamFlash::new(capacity))))
+    }
+
+    /// The flash after a reset now: a copy of what is programmed.
+    pub fn reset(&self) -> Self {
+        let bytes = self.0.borrow().bytes().to_vec();
+        Self(Rc::new(RefCell::new(RamFlash::from_bytes(bytes))))
+    }
+}
+
+impl Flash for Shared {
+    type Error = RamFlashError;
+    const ERASE_SIZE: u32 = RamFlash::ERASE_SIZE;
+    const WRITE_SIZE: u32 = RamFlash::WRITE_SIZE;
+
+    fn capacity(&self) -> u32 {
+        self.0.borrow().capacity()
+    }
+
+    fn read(&self, offset: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.borrow().read(offset, buf)
+    }
+
+    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().write(offset, data)
+    }
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.0.borrow_mut().erase(from, to)
+    }
+}
+
+/// `n` headers mined on `tip`, a second apart (regtest's proof of work takes a few tries).
+pub fn mine_headers(tip: &Header, n: usize) -> Vec<Header> {
+    let mut headers: Vec<Header> = Vec::with_capacity(n);
+    let mut prev = *tip;
+    for _ in 0..n {
+        let mut header = Header {
+            version: Version::from_consensus(0x2000_0000),
+            prev_blockhash: prev.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: prev.time + 1,
+            bits: prev.bits,
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        headers.push(header);
+        prev = header;
+    }
+    headers
 }

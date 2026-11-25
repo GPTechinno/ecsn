@@ -7,7 +7,9 @@
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network};
@@ -82,6 +84,8 @@ pub struct Node<S: ChainStore> {
     config: Config,
     /// The nonce of our `version` messages, to notice a connection to ourselves.
     nonce: u64,
+    /// A block was announced while syncing: sync again.
+    news: Cell<bool>,
 }
 
 impl<S: ChainStore> Node<S> {
@@ -92,6 +96,7 @@ impl<S: ChainStore> Node<S> {
             chain,
             config,
             nonce,
+            news: Cell::new(false),
         })
     }
 
@@ -145,26 +150,65 @@ impl<S: ChainStore> Node<S> {
     }
 
     /// Downloads and checks headers until the peer has no more. Returns the best header height.
+    /// The next batch is asked for as soon as a full one comes, from its last header, so that it
+    /// comes while this one is checked and the connection does not idle.
     pub async fn sync_headers<T: Read + Write>(
         &self,
         conn: &mut Connection<T>,
     ) -> Result<u32, Error<T::Error>> {
+        let locator = self.chain.get_block_locator().inspect_err(|e| {
+            warn!("block locator: {e:?}");
+        })?;
+        conn.send(&Message::GetHeaders {
+            locator,
+            stop: BlockHash::all_zeros(),
+        })
+        .await?;
         loop {
-            let locator = self.chain.get_block_locator()?;
-            conn.send(&Message::GetHeaders {
-                locator,
-                stop: BlockHash::all_zeros(),
-            })
-            .await?;
             let headers = loop {
-                if let Message::Headers(headers) = next(conn).await? {
+                let message = next(conn).await?;
+                if let Message::Headers(headers) = message {
+                    // A header announcement (`sendheaders`) can come before the answer. One that
+                    // does not connect to a header we have is skipped: the answer brings its
+                    // parents, or a sync after this one does.
+                    if let Some(first) = headers.first() {
+                        if self.chain.get_block_header(&first.prev_blockhash).is_err() {
+                            debug!(
+                                "headers from {} skipped: unknown parent",
+                                first.prev_blockhash
+                            );
+                            self.news.set(true);
+                            continue;
+                        }
+                    }
                     break headers;
                 }
+                self.note(&message);
             };
             let count = headers.len();
+            // a failure to ask is returned once this batch is kept
+            let asked = if count == MAX_HEADERS {
+                conn.send(&Message::GetHeaders {
+                    locator: vec![headers[count - 1].block_hash()],
+                    stop: BlockHash::all_zeros(),
+                })
+                .await
+            } else {
+                Ok(())
+            };
             for header in headers {
-                self.chain.accept_header(header)?;
+                self.chain.accept_header(header).inspect_err(|e| {
+                    warn!(
+                        "header {} on {}: {e:?}",
+                        header.block_hash(),
+                        header.prev_blockhash
+                    );
+                })?;
             }
+            // A reset then keeps the headers synced so far as the best chain: without it they
+            // would be found beyond the saved best chain, and the whole chain reindexed.
+            self.chain.flush()?;
+            asked?;
             let (height, hash) = self.chain.get_best_block()?;
             debug!("headers: {count} more, best {height} {hash}");
             if count < MAX_HEADERS {
@@ -305,7 +349,7 @@ impl<S: ChainStore> Node<S> {
                         return Err(Error::NotFound(hash));
                     }
                 }
-                _ => {}
+                other => self.note(&other),
             }
         }
     }
@@ -355,14 +399,26 @@ impl<S: ChainStore> Node<S> {
         .await?;
         self.sync(conn).await?;
         loop {
-            let news = match next(conn).await? {
-                Message::Inv(list) => list.iter().any(|i| i.block().is_some()),
-                Message::Headers(headers) => !headers.is_empty(),
-                _ => false,
-            };
-            if news {
+            // blocks announced during the last sync, or since
+            if !self.news.get() {
+                let message = next(conn).await?;
+                self.note(&message);
+            }
+            if self.news.take() {
                 self.sync(conn).await?;
             }
+        }
+    }
+
+    /// Notes a block announcement: an `inv` of a block, or headers.
+    fn note(&self, message: &Message) {
+        let announces = match message {
+            Message::Inv(list) => list.iter().any(|i| i.block().is_some()),
+            Message::Headers(headers) => !headers.is_empty(),
+            _ => false,
+        };
+        if announces {
+            self.news.set(true);
         }
     }
 
