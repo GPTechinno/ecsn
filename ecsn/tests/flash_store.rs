@@ -10,7 +10,8 @@ use ecsn::node::{Config, Node};
 use ecsn::store::{FlashChainStore, Layout, MemChainStore, RECORD_SIZE};
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
 use floresta_chain::{
-    BestChain, BlockchainInterface, ChainStore, ChainstoreError, DiskBlockHeader,
+    AssumeUtreexoValue, BestChain, BlockchainInterface, ChainStore, ChainstoreError,
+    DiskBlockHeader,
 };
 use rustreexo::proof::Proof;
 
@@ -78,7 +79,7 @@ fn the_board_flash_layout() {
     let capacity = 128 << 20;
     let layout = Layout::new(capacity, 8192).unwrap();
     assert_eq!(layout.slots, 1 << 21);
-    assert_eq!(layout.records, 1_353_193);
+    assert_eq!(layout.records, 1_296_810);
     assert!(3 * layout.records <= 2 * layout.slots);
     let parts = [
         (0, 8192),
@@ -236,6 +237,121 @@ fn a_reorg_overrides_the_index_across_resets() {
     let store = reset(store);
     assert_eq!(store.get_block_hash(8).unwrap(), Some(hash(8)));
     assert_eq!(store.get_block_hash(9).unwrap(), Some(hash(9)));
+}
+
+#[test]
+fn a_header_takes_one_record_and_two_when_its_parent_is_not_stored() {
+    let fixture = fixture();
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).header;
+    let header = |i: usize| fixture.blocks[i - 1].header;
+    let mut store = formatted(CAPACITY);
+    store
+        .save_header(&DiskBlockHeader::FullyValid(genesis, 0))
+        .unwrap();
+    for i in 1..=3 {
+        store
+            .save_header(&DiskBlockHeader::HeadersOnly(header(i), i as u32))
+            .unwrap();
+    }
+    assert_eq!(store.records(), 4);
+    // the parent of 10 is not stored: the record before 10's holds its hash
+    store
+        .save_header(&DiskBlockHeader::HeadersOnly(header(10), 10))
+        .unwrap();
+    assert_eq!(store.records(), 6);
+    // nor is that of 9, while 11's is
+    for i in [9, 11] {
+        store
+            .save_header(&DiskBlockHeader::HeadersOnly(header(i), i as u32))
+            .unwrap();
+    }
+    assert_eq!(store.records(), 9);
+    let check = |store: &FlashChainStore<RamFlash>| {
+        let stored = store.get_header(&genesis.block_hash()).unwrap().unwrap();
+        assert_eq!(*stored, genesis);
+        for i in [1, 2, 3, 9, 10, 11] {
+            let hash = fixture.blocks[i - 1].block_hash();
+            let stored = store.get_header(&hash).unwrap().unwrap();
+            assert_eq!(*stored, header(i), "{i}");
+            assert_eq!(stored.block_hash(), hash, "{i}");
+        }
+    };
+    check(&store);
+    check(&reset(store));
+}
+
+#[test]
+fn the_header_just_read_is_saved_again_with_its_height_checked() {
+    let fixture = fixture();
+    let header = |i: usize| fixture.blocks[i - 1].header;
+    let hash = |i: usize| fixture.blocks[i - 1].block_hash();
+    let mut store = formatted(CAPACITY);
+    for i in 1..=5 {
+        store
+            .save_header(&DiskBlockHeader::HeadersOnly(header(i), i as u32))
+            .unwrap();
+        store.update_block_index(i as u32, hash(i)).unwrap();
+    }
+    let records = store.records();
+    let read = store.get_header(&hash(3)).unwrap().unwrap();
+    store
+        .save_header(&DiskBlockHeader::FullyValid(*read, 3))
+        .unwrap();
+    assert_eq!(
+        store.get_header(&hash(3)).unwrap(),
+        Some(DiskBlockHeader::FullyValid(header(3), 3))
+    );
+    let read = store.get_header_by_height(4).unwrap().unwrap();
+    assert!(store
+        .save_header(&DiskBlockHeader::FullyValid(*read, 7))
+        .is_err());
+    // another header than the one just read
+    store
+        .save_header(&DiskBlockHeader::FullyValid(header(5), 5))
+        .unwrap();
+    assert_eq!(
+        store.get_header_by_height(5).unwrap(),
+        Some(DiskBlockHeader::FullyValid(header(5), 5))
+    );
+    assert_eq!(store.records(), records);
+}
+
+#[test]
+fn an_assumed_accumulator_makes_the_chain_below_it_valid_across_a_reset() {
+    let fixture = fixture();
+    let hash = |i: usize| fixture.blocks[i - 1].block_hash();
+    let flash = Shared::new(CAPACITY);
+    let store = FlashChainStore::mount(flash.clone(), Network::Regtest, true)
+        .unwrap()
+        .0;
+    let assumed = Config {
+        assume_utreexo: Some(AssumeUtreexoValue {
+            block_hash: hash(100),
+            height: 100,
+            roots: Vec::new(),
+            leaves: 0,
+        }),
+        ..config()
+    };
+    let node = Node::new(store, assumed, 0).unwrap();
+    for block in &fixture.blocks {
+        node.chain().accept_header(block.header).unwrap();
+    }
+    assert!(node.assume_utreexo().unwrap());
+    assert_eq!(node.chain().get_validation_index().unwrap(), 100);
+
+    let store = mount(flash.reset());
+    for (i, block) in fixture.blocks.iter().enumerate() {
+        let height = i as u32 + 1;
+        let expected = if height <= 100 {
+            DiskBlockHeader::FullyValid(block.header, height)
+        } else {
+            DiskBlockHeader::HeadersOnly(block.header, height)
+        };
+        assert_eq!(store.get_header(&hash(i + 1)).unwrap(), Some(expected));
+    }
+    let node = Node::new(store, config(), 0).unwrap();
+    assert_eq!(node.chain().get_validation_index().unwrap(), 100);
 }
 
 #[test]

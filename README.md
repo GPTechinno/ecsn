@@ -67,7 +67,9 @@ file starts from what it holds.
 `ecsn::store::FlashChainStore` keeps the chain on NOR flash (`ecsn::flash::Flash`: reads, programs
 that only clear bits, erases of whole blocks):
 
-- header records (88 bytes: the header, its height and a commit mark), appended;
+- header records (92 bytes: the header without the previous block's hash, which is its
+  parent's, the header's hash, its parent's record, its height and a commit mark), appended:
+  lookups compare stored hashes, and a header is hashed only when saved;
 - a hash table from block hashes to records and an index from heights to records, both made of
   slots written once;
 - a journal of the best chain, the index entries changed by reorgs and the headers marked
@@ -75,7 +77,7 @@ that only clear bits, erases of whole blocks):
 - the accumulators of the latest blocks, in a ring of erase blocks.
 
 The state of each header (valid, header only, in a fork) is kept in RAM and, after a reset,
-follows from the index and the best chain. 128 MB hold 1,353,193 headers. A power cut at any
+follows from the index and the best chain. 128 MB hold 1,296,810 headers. A power cut at any
 point leaves a store that mounts and resumes (`ecsn/tests/flash_store.rs` cuts the power at
 every 17th programmed byte of a run, in `ecsn::flash::RamFlash`).
 

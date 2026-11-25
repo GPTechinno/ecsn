@@ -3,8 +3,12 @@
 //! NOR flash programs only clear bits, and only an erase of a whole block sets them back, so
 //! everything here is written once, or appended:
 //!
-//! - **Header records**, 88 bytes each, appended: the header, then its height and the height's
-//!   complement, written last as the record's commit mark. A record is never rewritten.
+//! - **Header records**, 92 bytes each, appended: the header without the previous block's hash,
+//!   the header's own hash, the record of its parent (whose hash is the previous block's), then
+//!   its height and the height's complement, written last as the record's commit mark. A header
+//!   whose parent is not stored takes two records: the first holds the previous block's hash. A
+//!   record is never rewritten. Lookups compare the stored hashes: a header is hashed only when
+//!   it is saved, and not even then when it was just read.
 //! - **Hash table**: slots of 4 bytes, each written once, from a block hash to its record (21 bits)
 //!   with 11 more bits of the hash to skip most wrong candidates. Open addressing, linear probing,
 //!   at most two thirds full.
@@ -27,7 +31,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::Cell;
 
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -41,13 +45,23 @@ use floresta_chain::{
 use crate::flash::Flash;
 
 const MAGIC: [u8; 8] = *b"ECSNSTOR";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const SUPERBLOCK_SIZE: usize = 64;
 
-/// A header record: the header, its height, the height's complement.
-pub const RECORD_SIZE: u32 = 88;
+/// A header record: version, merkle root, time, bits and nonce, the header's hash, its parent's
+/// record, its height, the height's complement.
+pub const RECORD_SIZE: u32 = 92;
+const HASH_AT: u32 = 48;
+const PARENT_AT: u32 = 80;
+const MARK_AT: u32 = 84;
+/// The parent of a header whose previous block hash is zero (the genesis block).
+const NO_PARENT: u32 = 0xFFFF_FFFE;
+/// The parent of a header whose previous block's hash is in the record before it.
+const HASH_BEFORE: u32 = 0xFFFF_FFFD;
 /// The height of a header stored without one.
 const NO_HEIGHT: u32 = 0x7FFF_FFFF;
+/// The height of a record holding the previous block's hash of the next one.
+const PREVIOUS_HASH: u32 = 0x7FFF_FFFE;
 /// An erased slot or index entry.
 const EMPTY: u32 = u32::MAX;
 const RECORD_BITS: u32 = 21;
@@ -73,11 +87,9 @@ const ORPHAN: u8 = 3;
 const HEADERS_ONLY: u8 = 4;
 const IN_FORK: u8 = 5;
 const INVALID: u8 = 6;
-/// A record cut by a power loss before its commit mark.
+/// A record holding no header: one cut by a power loss before its commit mark, or the previous
+/// block's hash of the next one.
 const DEAD: u8 = 7;
-
-/// Records whose hash is cached.
-const HASH_CACHE: usize = 1024;
 
 /// Where each part of the store lies, in bytes from the start of the flash. Every part starts on
 /// an erase block.
@@ -104,7 +116,7 @@ pub struct Layout {
 impl Layout {
     /// The layout for a flash of `capacity` bytes erased by blocks of `erase_size`: a journal
     /// bank of 1/1024 of it, a ring of 1/128, and as many records as fit with a hash table at
-    /// most two thirds full. 128 MB give 1,353,193 records.
+    /// most two thirds full. 128 MB give 1,296,810 records.
     pub fn new(capacity: u32, erase_size: u32) -> Option<Self> {
         let e = erase_size;
         if e < 4096 || !e.is_power_of_two() || capacity % e != 0 {
@@ -268,7 +280,8 @@ pub struct FlashChainStore<F: Flash> {
     best: Option<BestChain>,
     journal: Journal,
     ring: Ring,
-    hashes: RefCell<Vec<Option<(u32, BlockHash)>>>,
+    /// The last header read, and its record: saving it again needs no lookup.
+    last_read: Cell<Option<(u32, BlockHeader)>>,
 }
 
 impl<F: Flash> FlashChainStore<F> {
@@ -348,7 +361,7 @@ impl<F: Flash> FlashChainStore<F> {
                 at: 0,
                 entries: BTreeMap::new(),
             },
-            hashes: RefCell::new(vec![None; HASH_CACHE]),
+            last_read: Cell::new(None),
         };
         store.mount_records()?;
         store.mount_journal()?;
@@ -404,7 +417,8 @@ impl<F: Flash> FlashChainStore<F> {
     }
 
     /// Finds the records written (they are written in order), and makes the last one consistent:
-    /// dead if its commit mark is missing, else in the hash table.
+    /// dead if its commit mark is missing or it holds a previous block's hash, else in the hash
+    /// table.
     fn mount_records(&mut self) -> Result<(), ChainstoreError> {
         let blank = |store: &Self, r: u32| -> Result<bool, ChainstoreError> {
             let mut buf = [0; RECORD_SIZE as usize];
@@ -423,28 +437,41 @@ impl<F: Flash> FlashChainStore<F> {
         self.records = lo;
         self.states = vec![UNKNOWN; lo as usize];
         if let Some(last) = lo.checked_sub(1) {
-            if self.committed_height(last)?.is_none() {
-                self.states[last as usize] = DEAD;
-            } else {
-                let hash = self.record_hash(last)?;
-                if self.find(&hash)? != Some(last) {
-                    self.insert_slot(&hash, last)?;
+            match self.committed_height(last)? {
+                None | Some(PREVIOUS_HASH) => self.states[last as usize] = DEAD,
+                Some(_) => {
+                    let hash = self.record_hash(last)?;
+                    if self.find(&hash)? != Some(last) {
+                        self.insert_slot(&hash, last)?;
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    /// The header of a record, its previous block's hash from its parent's record.
     fn read_header(&self, r: u32) -> Result<BlockHeader, ChainstoreError> {
+        let mut record = [0; MARK_AT as usize];
+        self.read(self.record_at(r), &mut record)?;
+        let mut prev = [0; 32];
+        match u32_at(&record, PARENT_AT as usize) {
+            NO_PARENT => {}
+            HASH_BEFORE if r > 0 => self.read(self.record_at(r - 1), &mut prev)?,
+            parent if parent < r => self.read(self.record_at(parent) + HASH_AT, &mut prev)?,
+            _ => return Err(ChainstoreError::CorruptedDatabase),
+        }
         let mut buf = [0; 80];
-        self.read(self.record_at(r), &mut buf)?;
+        buf[..4].copy_from_slice(&record[..4]);
+        buf[4..36].copy_from_slice(&prev);
+        buf[36..].copy_from_slice(&record[4..HASH_AT as usize]);
         deserialize(&buf).map_err(|_| ChainstoreError::CorruptedDatabase)
     }
 
     /// The record's height field, if its commit mark is whole.
     fn committed_height(&self, r: u32) -> Result<Option<u32>, ChainstoreError> {
         let mut buf = [0; 8];
-        self.read(self.record_at(r) + 80, &mut buf)?;
+        self.read(self.record_at(r) + MARK_AT, &mut buf)?;
         let height = u32_at(&buf, 0);
         Ok((height ^ u32_at(&buf, 4) == u32::MAX).then_some(height))
     }
@@ -458,15 +485,26 @@ impl<F: Flash> FlashChainStore<F> {
     }
 
     fn record_hash(&self, r: u32) -> Result<BlockHash, ChainstoreError> {
-        let slot = r as usize % HASH_CACHE;
-        if let Some((cached, hash)) = self.hashes.borrow()[slot] {
-            if cached == r {
-                return Ok(hash);
-            }
+        let mut hash = [0; 32];
+        self.read(self.record_at(r) + HASH_AT, &mut hash)?;
+        Ok(BlockHash::from_byte_array(hash))
+    }
+
+    /// Writes the next record: `body`, then the commit mark of `height`.
+    fn push_record(&mut self, body: &[u8], height: u32, state: u8) -> Result<u32, ChainstoreError> {
+        let r = self.records;
+        if r >= self.layout.records {
+            return Err(ChainstoreError::FullIndex);
         }
-        let hash = self.read_header(r)?.block_hash();
-        self.hashes.borrow_mut()[slot] = Some((r, hash));
-        Ok(hash)
+        let at = self.record_at(r);
+        self.write(at, body)?;
+        let mut mark = [0; 8];
+        mark[..4].copy_from_slice(&height.to_le_bytes());
+        mark[4..].copy_from_slice(&(!height).to_le_bytes());
+        self.write(at + MARK_AT, &mark)?;
+        self.records += 1;
+        self.states.push(state);
+        Ok(r)
     }
 
     fn append(
@@ -475,20 +513,21 @@ impl<F: Flash> FlashChainStore<F> {
         height: Option<u32>,
         hash: &BlockHash,
     ) -> Result<u32, ChainstoreError> {
-        let r = self.records;
-        if r >= self.layout.records {
-            return Err(ChainstoreError::FullIndex);
-        }
-        let at = self.record_at(r);
-        self.write(at, &serialize(header))?;
-        let height = height.unwrap_or(NO_HEIGHT);
-        let mut mark = [0; 8];
-        mark[..4].copy_from_slice(&height.to_le_bytes());
-        mark[4..].copy_from_slice(&(!height).to_le_bytes());
-        self.write(at + 80, &mark)?;
-        self.records += 1;
-        self.states.push(UNKNOWN);
-        self.hashes.borrow_mut()[r as usize % HASH_CACHE] = Some((r, *hash));
+        let parent = if header.prev_blockhash == BlockHash::all_zeros() {
+            NO_PARENT
+        } else if let Some(parent) = self.find(&header.prev_blockhash)? {
+            parent
+        } else {
+            self.push_record(header.prev_blockhash.as_byte_array(), PREVIOUS_HASH, DEAD)?;
+            HASH_BEFORE
+        };
+        let bytes = serialize(header);
+        let mut body = [0; MARK_AT as usize];
+        body[..4].copy_from_slice(&bytes[..4]);
+        body[4..HASH_AT as usize].copy_from_slice(&bytes[36..]);
+        body[HASH_AT as usize..PARENT_AT as usize].copy_from_slice(hash.as_byte_array());
+        body[PARENT_AT as usize..].copy_from_slice(&parent.to_le_bytes());
+        let r = self.push_record(&body, height.unwrap_or(NO_HEIGHT), UNKNOWN)?;
         self.insert_slot(hash, r)?;
         Ok(r)
     }
@@ -514,6 +553,7 @@ impl<F: Flash> FlashChainStore<F> {
 
     fn disk_header(&self, r: u32) -> Result<DiskBlockHeader, ChainstoreError> {
         let header = self.read_header(r)?;
+        self.last_read.set(Some((r, header)));
         let height = || self.height_of(r)?.ok_or(ChainstoreError::CorruptedDatabase);
         Ok(match self.state(r)? {
             FULLY_VALID => DiskBlockHeader::FullyValid(header, height()?),
@@ -902,18 +942,27 @@ impl<F: Flash> ChainStore for FlashChainStore<F> {
             DiskBlockHeader::InFork(_, h) => (IN_FORK, Some(h)),
             DiskBlockHeader::InvalidChain(_) => (INVALID, None),
         };
-        let hash = header.block_hash();
-        let r = match self.find(&hash)? {
-            Some(r) => {
-                if height.is_some() && self.height_of(r)? != height {
-                    return Err(ChainstoreError::Other(format!(
-                        "header {hash} saved at another height than stored"
-                    )));
-                }
-                r
-            }
-            None => self.append(header, height, &hash)?,
+        // a header just read (as when walking down the chain) is not hashed again
+        let stored = match self.last_read.get() {
+            Some((r, last)) if last == **header => Some(r),
+            _ => None,
         };
+        let (r, appended) = match stored {
+            Some(r) => (r, false),
+            None => {
+                let hash = header.block_hash();
+                match self.find(&hash)? {
+                    Some(r) => (r, false),
+                    None => (self.append(header, height, &hash)?, true),
+                }
+            }
+        };
+        if !appended && height.is_some() && self.height_of(r)? != height {
+            return Err(ChainstoreError::Other(format!(
+                "header {} saved at another height than stored",
+                self.record_hash(r)?
+            )));
+        }
         let invalid = self.invalid.contains(&r);
         if state == INVALID && !invalid {
             self.journal_append(ENTRY_INVALID, &r.to_le_bytes())?;
