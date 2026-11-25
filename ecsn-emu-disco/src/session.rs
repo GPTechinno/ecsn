@@ -84,8 +84,18 @@ fn log(snapshot: &mut Snapshot, line: String) {
     if let Some(address) = line.split("Ethernet: ").nth(1).filter(|a| a.contains('/')) {
         snapshot.address = Some(address.trim().to_string());
     }
-    if let Some(height) = line.split("validated up to ").nth(1) {
-        snapshot.validated = Some(height.trim().to_string());
+    // Each block validated (floresta's "New tip! hash=… height=N …"), and the
+    // node's progress ("validated up to N of M")
+    let height = if line.contains("New tip!") {
+        line.split("height=").nth(1)
+    } else {
+        line.split("validated up to ").nth(1)
+    };
+    if let Some(height) = height {
+        let digits: String = height.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            snapshot.validated = Some(digits);
+        }
     }
     snapshot.logs.push_back(line);
     snapshot.log_count += 1;
@@ -177,4 +187,31 @@ fn run(
         }
     }
     let _ = disco.save_qspi();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_validated_height_follows_each_new_tip_and_the_progress() {
+        let mut snapshot = Snapshot::default();
+        log(
+            &mut snapshot,
+            "99.577000 99.575717 INFO  floresta_chain::pruned_utreexo::chain_state: New tip! \
+             hash=0000000c823ba5a1 height=331882 tx_count=289"
+                .into(),
+        );
+        assert_eq!(snapshot.validated.as_deref(), Some("331882"));
+        log(
+            &mut snapshot,
+            "INFO  ecsn::node: validated up to 332000 of 332441".into(),
+        );
+        assert_eq!(snapshot.validated.as_deref(), Some("332000"));
+        log(
+            &mut snapshot,
+            "INFO  ecsn::node: headers synced: best 332441".into(),
+        );
+        assert_eq!(snapshot.validated.as_deref(), Some("332000"));
+    }
 }
