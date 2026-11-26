@@ -46,9 +46,15 @@ struct Args {
     #[arg(long, default_value_t = 10.0)]
     seconds: f64,
     /// The QSPI flash image, read at the start (an erased flash if missing)
-    /// and written at the end
+    /// and written at the end, and at each RESET from the window, so the
+    /// firmware finds its chain store again at the next run [default:
+    /// $XDG_DATA_HOME/ecsn-emu-disco/qspi.bin, or
+    /// ~/.local/share/ecsn-emu-disco/qspi.bin]
     #[arg(long)]
     qspi: Option<PathBuf>,
+    /// Start from an erased QSPI flash and save it nowhere
+    #[arg(long, conflicts_with = "qspi")]
+    volatile: bool,
     /// Keep virtual time no faster than the wall clock (for real peers)
     #[arg(long)]
     realtime: bool,
@@ -79,8 +85,24 @@ fn parse_range(text: &str) -> Result<(u32, u32), String> {
     Ok((parse(start)?, parse(end)?))
 }
 
+/// Where the QSPI flash image is kept between runs, when `--qspi` names none.
+fn default_qspi() -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
+    Some(data.join("ecsn-emu-disco").join("qspi.bin"))
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
+    let qspi = if args.volatile {
+        None
+    } else {
+        args.qspi.clone().or_else(default_qspi)
+    };
     let elf = match std::fs::read(&args.elf) {
         Ok(elf) => elf,
         Err(e) => {
@@ -89,10 +111,10 @@ fn main() -> ExitCode {
         }
     };
     if !args.headless {
-        gui::run(elf, args.qspi, args.panel);
+        gui::run(elf, qspi, args.panel);
         return ExitCode::SUCCESS;
     }
-    let mut disco = match Disco::new(&elf, args.qspi.as_deref(), args.panel) {
+    let mut disco = match Disco::new(&elf, qspi.as_deref(), args.panel) {
         Ok(disco) => disco,
         Err(e) => {
             eprintln!("{e}");

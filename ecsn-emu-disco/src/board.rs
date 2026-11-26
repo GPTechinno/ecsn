@@ -227,10 +227,18 @@ impl Disco {
             .map_err(|e| error(&e))
     }
 
-    /// Saves the QSPI flash where it was read from.
+    /// Saves the QSPI flash where it was read from, creating its directory,
+    /// through a temporary file renamed over the image, so an interrupted save
+    /// leaves the previous image whole.
     pub fn save_qspi(&self) -> std::io::Result<()> {
         if let Some(path) = &self.qspi_path {
-            std::fs::write(path, &self.machine.periph().quadspi.flash.bytes)?;
+            if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut temporary = path.clone().into_os_string();
+            temporary.push(".saving");
+            std::fs::write(&temporary, &self.machine.periph().quadspi.flash.bytes)?;
+            std::fs::rename(&temporary, path)?;
         }
         Ok(())
     }

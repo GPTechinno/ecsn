@@ -147,7 +147,9 @@ fn run(
         match inbox.try_recv() {
             Ok(Command::Quit) | Err(TryRecvError::Disconnected) => break,
             Ok(Command::Reset) => {
-                let _ = disco.save_qspi();
+                if let Err(e) = disco.save_qspi() {
+                    eprintln!("ecsn-emu-disco: QSPI image: {e}");
+                }
                 stopped = match Disco::new(&elf, qspi.as_deref(), controller) {
                     Ok(new) => {
                         disco = new;
@@ -215,7 +217,9 @@ fn run(
             wake();
         }
     }
-    let _ = disco.save_qspi();
+    if let Err(e) = disco.save_qspi() {
+        eprintln!("ecsn-emu-disco: QSPI image: {e}");
+    }
 }
 
 #[cfg(test)]
