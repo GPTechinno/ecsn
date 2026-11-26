@@ -126,8 +126,7 @@ checksum = "e8bea3a9f0cfece4564e37cb49a38cc245ca5184719e50d7d0dda3268722c4e2"
 [[package]]
 name = "bitcoin-io"
 version = "0.1.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb5de036369d1ac59d3c1819ebc4d850f89466f5401c571a285b6ed564a4cb78"
+source = "git+https://github.com/GPTechinno/rust-bitcoin?branch=hashes-sha256-extern#2d1c93d7fe2d43066220cedbbd6d32fa9950eed7"
 dependencies = [
  "bitcoin-consensus-encoding",
 ]
@@ -155,8 +154,7 @@ dependencies = [
 [[package]]
 name = "bitcoin_hashes"
 version = "0.14.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bca4c7abb40c8817d77403c880988cfd484f23ab2365726afb2f798363e2c4a2"
+source = "git+https://github.com/GPTechinno/rust-bitcoin?branch=hashes-sha256-extern#2d1c93d7fe2d43066220cedbbd6d32fa9950eed7"
 dependencies = [
  "bitcoin-io 0.1.101",
  "hex-conservative 0.2.3",
@@ -477,6 +475,7 @@ name = "ecsn-firmware"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "bitcoin_hashes 0.14.101",
  "blit",
  "blit-cpu",
  "blit-gui",

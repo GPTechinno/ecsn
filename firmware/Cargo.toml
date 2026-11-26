@@ -14,6 +14,9 @@ publish = false
 [dependencies]
 ecsn = { path = "../ecsn" }
 bitcoin = { version = "0.32.8", default-features = false }
+# SHA-256's block compression through `bitcoin_hashes_sha256_compress` (see `src/main.rs`), which
+# the emulator runs natively
+bitcoin_hashes = { version = "0.14.101", default-features = false, features = ["sha256-extern"] }
 # floresta-chain without std (getfloresta/Floresta#1501, merged), with its walks back along the
 # chain and its header acceptance hashing each header once (not upstream yet): the
 # `perf-header-sync` branch of the fork, on its `perf-chain-walks`
@@ -57,3 +60,10 @@ debug = 2
 incremental = false
 lto = "fat"
 opt-level = "s"
+
+[patch.crates-io]
+# bitcoin_hashes 0.14.101 with the `sha256-extern` feature, and the bitcoin-io 0.1.101 beside it in
+# the same workspace (so that there is one `io::Write`): the `hashes-sha256-extern` branch of the
+# fork of rust-bitcoin, from its `0.32.xxx`
+bitcoin_hashes = { git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-sha256-extern" }
+bitcoin-io = { git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-sha256-extern" }

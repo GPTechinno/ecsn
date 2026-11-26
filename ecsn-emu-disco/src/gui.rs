@@ -153,6 +153,7 @@ struct Launch {
     elf: Vec<u8>,
     qspi: Option<PathBuf>,
     panel: Controller,
+    host_sha: bool,
 }
 
 static HANDOFF: Mutex<Option<Launch>> = Mutex::new(None);
@@ -231,9 +232,15 @@ impl Application for App {
             }
         };
         let launch = HANDOFF.lock().unwrap().take().expect("emulator handoff");
-        let session = Session::start(launch.elf, launch.qspi, launch.panel, move || {
-            let _ = proxy.send_event(Wake);
-        });
+        let session = Session::start(
+            launch.elf,
+            launch.qspi,
+            launch.panel,
+            launch.host_sha,
+            move || {
+                let _ = proxy.send_event(Wake);
+            },
+        );
         let snapshot = session.snapshot.clone();
         *SESSION.lock().unwrap() = Some(session);
         Self {
@@ -569,7 +576,7 @@ impl Application for App {
 
 /// Opens the window with the board running `elf`, and stops the board, which
 /// saves its flash image, when the window closes.
-pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>, panel: Controller) {
+pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>, panel: Controller, host_sha: bool) {
     let text = TextSystem::new(
         TextConfig {
             fonts: vec![
@@ -591,7 +598,12 @@ pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>, panel: Controller) {
     )
     .expect("text system");
     let graphics = cpu::Backend::new(text, cpu::Config::default());
-    *HANDOFF.lock().unwrap() = Some(Launch { elf, qspi, panel });
+    *HANDOFF.lock().unwrap() = Some(Launch {
+        elf,
+        qspi,
+        panel,
+        host_sha,
+    });
     blit_desktop::run::<App>(Config {
         title: "STM32H747I-DISCO emulator".into(),
         width: (PHOTO_SIZE.0 + SIDE_WIDTH + 3.0 * GAP) as u32,

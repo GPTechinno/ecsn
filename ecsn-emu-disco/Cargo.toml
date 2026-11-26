@@ -17,6 +17,8 @@ stm32h7-rax = { git = "https://github.com/GPTechinno/stm32h7-rax", branch = "mai
 esp32s3-rax = { git = "https://github.com/GPTechinno/esp32s3-rax", branch = "main" }
 defmt-decoder = "1.2"
 goblin = "0.10"
+# the SHA-256 compression of the firmware, run on the host
+sha2 = { version = "0.10", features = ["compress"] }
 png = "0.18"
 rustc-demangle = "0.1"
 ctrlc = { version = "3", features = ["termination"] }

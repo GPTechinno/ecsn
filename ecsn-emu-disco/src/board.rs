@@ -13,7 +13,9 @@ use esp32s3_rax::machine::TICK_HZ;
 use esp32s3_rax::net::nat::{Router, RouterConfig};
 use stm32h7_rax::devices::ltdc::Frame;
 use stm32h7_rax::devices::rcc::RESET_IWDG1;
-use stm32h7_rax::{Config, Event, Stm32h7};
+use stm32h7_rax::rax::isa::arm::common::cpu::ArmCpu;
+use stm32h7_rax::rax::isa::arm::cortex_m::CortexMCpu;
+use stm32h7_rax::{Config, Event, HostFunction, Stm32h7};
 
 use crate::logs::Logs;
 use crate::panel::{Controller, Panel, PanelState};
@@ -44,6 +46,8 @@ pub struct Disco {
     pub machine: Stm32h7,
     elf: Vec<u8>,
     controller: Controller,
+    /// Whether the firmware's SHA-256 compression runs on the host.
+    host_sha: bool,
     /// The virtual time, instructions and sleep of the chips before this one
     /// (each reset starts a new chip).
     before: (u64, u64, u64),
@@ -68,8 +72,14 @@ pub struct Output {
 impl Disco {
     /// The board with the firmware `elf`, the QSPI flash from `qspi` (an
     /// erased flash if the file does not exist; saved there by
-    /// [`Disco::save_qspi`]), and a display with the `controller`.
-    pub fn new(elf: &[u8], qspi: Option<&Path>, controller: Controller) -> Result<Self, String> {
+    /// [`Disco::save_qspi`]), and a display with the `controller`; with
+    /// `host_sha`, the firmware's SHA-256 compression runs on the host.
+    pub fn new(
+        elf: &[u8],
+        qspi: Option<&Path>,
+        controller: Controller,
+        host_sha: bool,
+    ) -> Result<Self, String> {
         let flash = match qspi {
             Some(path) if path.exists() => {
                 let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -80,11 +90,12 @@ impl Disco {
             }
             _ => vec![0xFF; QSPI_BYTES],
         };
-        let (machine, panel) = Self::chip(elf, flash, controller)?;
+        let (machine, panel) = Self::chip(elf, flash, controller, host_sha)?;
         Ok(Self {
             machine,
             elf: elf.to_vec(),
             controller,
+            host_sha,
             before: (0, 0, 0),
             logs: Logs::new(elf)?,
             router: Router::new(RouterConfig::default(), 0),
@@ -102,6 +113,7 @@ impl Disco {
         elf: &[u8],
         flash: Vec<u8>,
         controller: Controller,
+        host_sha: bool,
     ) -> Result<(Stm32h7, Arc<Mutex<PanelState>>), String> {
         let config = Config {
             hse_hz: HSE_HZ,
@@ -112,7 +124,10 @@ impl Disco {
             boot_address: BOOT,
             seed: 0x5eed_ec5e,
         };
-        let machine = Stm32h7::new(config, elf)?;
+        let mut machine = Stm32h7::new(config, elf)?;
+        if host_sha && let Some(entry) = symbol(elf, SHA256_COMPRESS) {
+            machine.host_function(entry, SHA256_COMPRESS, Box::new(Sha256Compress::default()));
+        }
         let panel = Panel::new(controller);
         let state = panel.state.clone();
         {
@@ -134,7 +149,7 @@ impl Disco {
             let p = self.machine.periph();
             (p.quadspi.flash.bytes.clone(), p.rcc.reset_flags())
         };
-        let (machine, panel) = Self::chip(&self.elf, flash, self.controller)?;
+        let (machine, panel) = Self::chip(&self.elf, flash, self.controller, self.host_sha)?;
         machine.periph().rcc.set_reset_flags(kept | flags);
         let trace = self.machine.periph().trace;
         machine.periph().trace = trace;
@@ -304,5 +319,72 @@ impl Disco {
             std::fs::rename(&temporary, path)?;
         }
         Ok(())
+    }
+}
+
+/// The firmware's SHA-256 block compression (`bitcoin_hashes`' `sha256-extern` feature).
+const SHA256_COMPRESS: &str = "bitcoin_hashes_sha256_compress";
+
+/// The address of the ELF's symbol `name`.
+fn symbol(elf: &[u8], name: &str) -> Option<u32> {
+    let image = goblin::elf::Elf::parse(elf).ok()?;
+    image
+        .syms
+        .iter()
+        .find(|s| image.strtab.get_at(s.st_name) == Some(name))
+        .map(|s| s.st_value as u32)
+}
+
+/// `bitcoin_hashes_sha256_compress(state: *mut [u32; 8], block: *const [u8; 64])` on the host.
+#[derive(Default)]
+struct Sha256Compress {
+    /// Where the state of the call the core runs is, and what it should become.
+    at: u32,
+    expected: [u32; 8],
+}
+
+impl Sha256Compress {
+    /// The state at `at`, eight words in the core's byte order.
+    fn state_at(cpu: &CortexMCpu, at: u32) -> [u32; 8] {
+        let mut bytes = [0; 32];
+        let _ = cpu.memory().read(u64::from(at), &mut bytes);
+        std::array::from_fn(|i| {
+            u32::from_le_bytes([
+                bytes[4 * i],
+                bytes[4 * i + 1],
+                bytes[4 * i + 2],
+                bytes[4 * i + 3],
+            ])
+        })
+    }
+
+    /// The state at r0 once the block at r1 is compressed into it.
+    fn compute(cpu: &CortexMCpu) -> [u32; 8] {
+        let mut state = Self::state_at(cpu, cpu.get_gpr(0) as u32);
+        let mut block = [0; 64];
+        let _ = cpu
+            .memory()
+            .read(u64::from(cpu.get_gpr(1) as u32), &mut block);
+        sha2::compress256(&mut state, &[block.into()]);
+        state
+    }
+}
+
+impl HostFunction for Sha256Compress {
+    fn run(&mut self, cpu: &mut CortexMCpu) {
+        let state = Self::compute(cpu);
+        let bytes: Vec<u8> = state.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let at = cpu.get_gpr(0) as u32;
+        let _ = cpu.memory_mut().write(u64::from(at), &bytes);
+    }
+
+    fn expect(&mut self, cpu: &CortexMCpu) {
+        self.at = cpu.get_gpr(0) as u32;
+        self.expected = Self::compute(cpu);
+    }
+
+    fn matches(&mut self, cpu: &CortexMCpu) -> bool {
+        // r0 is free in the callee: the state's address is taken at the entry
+        Self::state_at(cpu, self.at) == self.expected
     }
 }

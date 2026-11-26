@@ -75,6 +75,11 @@ struct Args {
     /// NT35510 of later ones; `none` for no panel on the DSI link
     #[arg(long, value_enum, default_value = "otm8009a")]
     panel: Controller,
+    /// Run the firmware's SHA-256 compression on the emulated core too; by
+    /// default the host runs it, charged the cycles the core took for its
+    /// first calls, so virtual time is the same
+    #[arg(long)]
+    no_host_sha: bool,
     /// Save what the display shows as a PNG at the end of a headless run
     #[arg(long, value_name = "PNG")]
     screen_png: Option<PathBuf>,
@@ -149,10 +154,10 @@ fn main() -> ExitCode {
                 .to_string())
     );
     if !args.headless {
-        gui::run(elf, qspi, args.panel);
+        gui::run(elf, qspi, args.panel, !args.no_host_sha);
         return ExitCode::SUCCESS;
     }
-    let mut disco = match Disco::new(&elf, qspi.as_deref(), args.panel) {
+    let mut disco = match Disco::new(&elf, qspi.as_deref(), args.panel, !args.no_host_sha) {
         Ok(disco) => disco,
         Err(e) => {
             eprintln!("{e}");

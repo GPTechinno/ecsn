@@ -60,17 +60,20 @@ pub struct Session {
 
 impl Session {
     /// Runs `elf` on the board with the QSPI flash image `qspi` and a panel
-    /// with `controller`; `wake` is called after each snapshot.
+    /// with `controller` (with `host_sha`, the firmware's SHA-256 compression
+    /// on the host); `wake` is called after each snapshot.
     pub fn start(
         elf: Vec<u8>,
         qspi: Option<PathBuf>,
         controller: Controller,
+        host_sha: bool,
         wake: impl Fn() + Send + 'static,
     ) -> Self {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let (commands, inbox) = channel();
         let shared = snapshot.clone();
-        let thread = std::thread::spawn(move || run(elf, qspi, controller, inbox, shared, wake));
+        let thread =
+            std::thread::spawn(move || run(elf, qspi, controller, host_sha, inbox, shared, wake));
         Self {
             snapshot,
             commands,
@@ -119,11 +122,12 @@ fn run(
     elf: Vec<u8>,
     qspi: Option<PathBuf>,
     controller: Controller,
+    host_sha: bool,
     inbox: Receiver<Command>,
     shared: Arc<Mutex<Snapshot>>,
     wake: impl Fn(),
 ) {
-    let mut disco = match Disco::new(&elf, qspi.as_deref(), controller) {
+    let mut disco = match Disco::new(&elf, qspi.as_deref(), controller, host_sha) {
         Ok(disco) => disco,
         Err(e) => {
             shared.lock().unwrap().stopped = Some(e);

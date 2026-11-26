@@ -24,7 +24,10 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 [GPTechinno/Floresta](https://github.com/GPTechinno/Floresta): upstream's `master`, which builds it
 without `std` since getfloresta/Floresta#1501, its walks back along the chain that no longer hash
 headers (branch `perf-chain-walks`), and its header acceptance hashing each header once, not
-upstream yet.
+upstream yet. The firmware also takes `bitcoin_hashes` 0.14.101 from the `hashes-sha256-extern`
+branch of [GPTechinno/rust-bitcoin](https://github.com/GPTechinno/rust-bitcoin) (a `[patch]`): its
+SHA-256 compression is then the firmware's `bitcoin_hashes_sha256_compress`, which the emulator
+runs on the host.
 
 ## Environment
 
