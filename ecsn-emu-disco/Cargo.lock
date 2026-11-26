@@ -860,7 +860,7 @@ dependencies = [
  "goblin",
  "hmac",
  "pbkdf2",
- "rax",
+ "rax 0.1.0 (git+https://github.com/Georges760/rax?branch=feat%2Fxtensa-esp32s3)",
  "sha1",
  "sha2",
  "smoltcp",
@@ -2202,6 +2202,32 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 [[package]]
 name = "rax"
 version = "0.1.0"
+source = "git+https://github.com/Georges760/rax?branch=feat%2Fcortex-m7-fp-data#848bce8cd468eea80a03c756f8fc0f3f251a7fff"
+dependencies = [
+ "bitflags 2.13.2",
+ "clap",
+ "ctrlc",
+ "getrandom",
+ "goblin",
+ "libc",
+ "linux-loader",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uklad",
+ "vm-memory",
+ "zstd",
+]
+
+[[package]]
+name = "rax"
+version = "0.1.0"
+source = "git+https://github.com/Georges760/rax?branch=feat%2Fxtensa-esp32s3#e395fe44df3795f29113914e4041cd294781fccf"
 dependencies = [
  "bitflags 2.13.2",
  "clap",
@@ -2630,7 +2656,7 @@ name = "stm32h7-rax"
 version = "0.1.0"
 dependencies = [
  "goblin",
- "rax",
+ "rax 0.1.0 (git+https://github.com/Georges760/rax?branch=feat%2Fcortex-m7-fp-data)",
 ]
 
 [[package]]
