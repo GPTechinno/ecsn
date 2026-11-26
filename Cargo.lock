@@ -318,6 +318,7 @@ dependencies = [
  "floresta-chain",
  "rustreexo",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

@@ -37,6 +37,7 @@ extern crate alloc;
 
 mod display;
 mod gui;
+mod heap;
 mod log;
 mod mpu;
 mod qspi;
@@ -73,8 +74,8 @@ use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{bind_interrupts, eth, peripherals, SharedData};
 use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
-use embedded_alloc::TlsfHeap;
 use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
+use heap::Heap;
 use screen::Screen;
 use static_cell::StaticCell;
 use stm32_fmc::devices::is42s32800g_6::Is42s32800g;
@@ -86,7 +87,7 @@ bind_interrupts!(struct Irqs {
 });
 
 #[global_allocator]
-static HEAP: TlsfHeap = TlsfHeap::empty();
+static HEAP: Heap = Heap::empty();
 
 /// The clock configuration, shared with the Cortex-M4 core.
 #[unsafe(link_section = ".ram_d3.shared_data")]
@@ -705,10 +706,15 @@ async fn follow<S: ChainStore>(
             if armed {
                 watchdog.pet();
             }
-            let used = sdram::SIZE - HEAP.free();
-            if used >= heap_peak + (1 << 20) {
-                heap_peak = used;
-                info!("heap: {=usize} KB used, the most so far", used >> 10);
+            let peak = HEAP.peak();
+            if peak >= heap_peak + (1 << 20) {
+                heap_peak = peak;
+                info!(
+                    "heap: {=usize} KB allocated at most, {=usize} KB now, {=usize} KB of the SDRAM taken",
+                    peak >> 10,
+                    HEAP.allocated() >> 10,
+                    (sdram::SIZE - HEAP.free()) >> 10
+                );
             }
         }
     };

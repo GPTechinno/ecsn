@@ -3,14 +3,18 @@
 //!
 //! The chain is kept in RAM, or with `--store` on the flash chain store, in a file holding a
 //! flash image.
+//!
+//! The heap's peak is logged as it grows by a MiB (as the firmware does), and `--heap-limit`
+//! fails the allocations beyond a size, as a board's RAM does.
 
 mod file_flash;
+mod heap;
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::Network;
 use clap::Parser;
@@ -21,7 +25,11 @@ use embedded_io_adapters::tokio_1::FromTokio;
 use file_flash::FileFlash;
 use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
 use tokio::net::TcpStream;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+#[global_allocator]
+static HEAP: heap::Counted = heap::Counted::new();
 
 #[derive(Parser)]
 struct Args {
@@ -46,6 +54,9 @@ struct Args {
     /// Blocks asked for at once while syncing
     #[arg(long, default_value_t = 16)]
     blocks_in_flight: usize,
+    /// Fail the allocations that would take the heap beyond this many MiB, as a board's RAM does
+    #[arg(long, value_name = "MIB")]
+    heap_limit: Option<usize>,
 }
 
 fn default_port(network: Network) -> u16 {
@@ -65,6 +76,26 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    if let Some(mib) = args.heap_limit {
+        HEAP.set_limit(mib << 20);
+    }
+    // The heap's peak, looked at between the node's steps, as the firmware's guard does; the
+    // peak counts the allocations made inside a step too.
+    tokio::spawn(async {
+        let mut logged = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let peak = HEAP.peak();
+            if peak >= logged + (1 << 20) {
+                logged = peak;
+                info!(
+                    "heap: {} KiB at most, {} KiB now",
+                    peak >> 10,
+                    HEAP.used() >> 10
+                );
+            }
+        }
+    });
     let config = Config {
         network: args.network,
         user_agent: concat!("/ecsn:", env!("CARGO_PKG_VERSION"), "/").into(),

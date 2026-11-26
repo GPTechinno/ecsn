@@ -14,6 +14,7 @@ bitcoin = { workspace = true, features = ["std"] }
 floresta-chain = { workspace = true, features = ["std"] }
 rustreexo = { workspace = true, features = ["std"] }
 embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
-tokio = { version = "1", features = ["rt", "net", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }

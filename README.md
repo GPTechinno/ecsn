@@ -63,7 +63,11 @@ to compare.
 
 With `--store <file>`, `ecsn-host` keeps the chain in the flash chain store, in a file holding the
 image of a NOR flash (created erased, 128 MiB by default, `--store-size`). A later run on the same
-file starts from what it holds.
+file starts from what it holds. The emulator's flash images are such files.
+
+`ecsn-host` logs the heap's peak as it grows by a MiB, the bytes allocated at once at most, and
+`--heap-limit <MiB>` fails the allocations beyond that many MiB, as the board's 32 MB of SDRAM
+does (its structures take more there, with 64-bit pointers).
 
 `ecsn/tests/data/regtest-111.txt` is such a chain recorded from utreexod (blocks 1 to 111, block
 111's Utreexo data and the accumulator after it), which the tests validate and tamper with.

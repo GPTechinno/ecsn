@@ -372,9 +372,10 @@ impl<S: ChainStore> Node<S> {
                 block
                     .check_block_structure()
                     .map_err(BlockchainError::from)?;
+                let proof_hashes = proof.hashes.len();
                 self.connect_block(height, &block, &leaf_data, proof)?;
                 debug!(
-                    "block {height} {hash}: {} transactions, {} inputs proven",
+                    "block {height} {hash}: {} transactions, {} inputs proven by {proof_hashes} hashes",
                     block.txdata.len(),
                     leaf_data.len()
                 );
