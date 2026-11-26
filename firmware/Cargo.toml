@@ -22,6 +22,13 @@ embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h747xi-cm7", "ti
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet"] }
+embassy-futures = "0.1"
+# the display's user interface: BLIT, from a local checkout (`upstream/blit`) built without std
+blit = { path = "../../upstream/blit/kernel" }
+blit-gui = { path = "../../upstream/blit/gui" }
+blit-cpu = { path = "../../upstream/blit/gui/cpu", default-features = false }
+blit-text = { path = "../../upstream/blit/gui/text" }
+blit-widget = { path = "../../upstream/blit/widget", default-features = false }
 embedded-io-async = "0.7"
 stm32-fmc = "0.4.0"
 embedded-alloc = { version = "0.7.0", default-features = false, features = ["tlsf"] }
@@ -32,6 +39,10 @@ cortex-m-rt = "0.7.7"
 defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[build-dependencies]
+# renders the display's glyphs
+fontdue = "0.9"
 
 [profile.dev]
 # unoptimised code is too slow and too large for the 1 MB flash bank of the Cortex-M7

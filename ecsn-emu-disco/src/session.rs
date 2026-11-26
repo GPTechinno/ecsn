@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use stm32h7_rax::Event;
 
-use crate::board::Disco;
+use crate::board::{Disco, Screen};
 use crate::pace::Pace;
+use crate::panel::Controller;
 
 const PS_PER_S: u64 = 1_000_000_000_000;
 /// Virtual time between two looks at the board: 1 ms.
@@ -20,6 +21,8 @@ const STEP: u64 = PS_PER_S / 1000;
 const FRAME: Duration = Duration::from_millis(33);
 /// Log lines kept for the window.
 const LOG_LINES: usize = 5000;
+/// Real time between two looks at the display.
+const SCREEN_EVERY: Duration = Duration::from_millis(100);
 
 /// What the window shows.
 #[derive(Clone, Default)]
@@ -38,6 +41,8 @@ pub struct Snapshot {
     pub validated: Option<String>,
     /// Why the firmware stopped.
     pub stopped: Option<String>,
+    /// What the display shows.
+    pub screen: Arc<Screen>,
 }
 
 pub enum Command {
@@ -53,13 +58,18 @@ pub struct Session {
 }
 
 impl Session {
-    /// Runs `elf` on the board with the QSPI flash image `qspi`; `wake` is
-    /// called after each snapshot.
-    pub fn start(elf: Vec<u8>, qspi: Option<PathBuf>, wake: impl Fn() + Send + 'static) -> Self {
+    /// Runs `elf` on the board with the QSPI flash image `qspi` and a panel
+    /// with `controller`; `wake` is called after each snapshot.
+    pub fn start(
+        elf: Vec<u8>,
+        qspi: Option<PathBuf>,
+        controller: Controller,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let (commands, inbox) = channel();
         let shared = snapshot.clone();
-        let thread = std::thread::spawn(move || run(elf, qspi, inbox, shared, wake));
+        let thread = std::thread::spawn(move || run(elf, qspi, controller, inbox, shared, wake));
         Self {
             snapshot,
             commands,
@@ -107,11 +117,12 @@ fn log(snapshot: &mut Snapshot, line: String) {
 fn run(
     elf: Vec<u8>,
     qspi: Option<PathBuf>,
+    controller: Controller,
     inbox: Receiver<Command>,
     shared: Arc<Mutex<Snapshot>>,
     wake: impl Fn(),
 ) {
-    let mut disco = match Disco::new(&elf, qspi.as_deref()) {
+    let mut disco = match Disco::new(&elf, qspi.as_deref(), controller) {
         Ok(disco) => disco,
         Err(e) => {
             shared.lock().unwrap().stopped = Some(e);
@@ -121,6 +132,10 @@ fn run(
     };
     let mut pace = Pace::new(disco.machine.now());
     let mut last_frame = Instant::now();
+    let mut last_screen = Instant::now();
+    // the board's screen generation last taken, and the window's
+    let mut seen_screen = u64::MAX;
+    let mut shown = 0;
     let mut window = (
         Instant::now(),
         disco.machine.now(),
@@ -133,7 +148,7 @@ fn run(
             Ok(Command::Quit) | Err(TryRecvError::Disconnected) => break,
             Ok(Command::Reset) => {
                 let _ = disco.save_qspi();
-                stopped = match Disco::new(&elf, qspi.as_deref()) {
+                stopped = match Disco::new(&elf, qspi.as_deref(), controller) {
                     Ok(new) => {
                         disco = new;
                         None
@@ -141,6 +156,7 @@ fn run(
                     Err(e) => Some(e),
                 };
                 pending.push("emu: reset".into());
+                seen_screen = u64::MAX;
                 pace = Pace::new(disco.machine.now());
                 window = (Instant::now(), 0, 0);
             }
@@ -183,6 +199,19 @@ fn run(
             s.asleep = disco.machine.asleep as f64 / disco.machine.now().max(1) as f64;
             s.stopped = stopped.clone();
             drop(s);
+            if last_screen.elapsed() >= SCREEN_EVERY {
+                last_screen = Instant::now();
+                let screen = disco.screen();
+                if screen.generation != seen_screen {
+                    seen_screen = screen.generation;
+                    shown += 1;
+                    let screen = Arc::new(Screen {
+                        frame: screen.frame.clone(),
+                        generation: shown,
+                    });
+                    shared.lock().unwrap().screen = screen;
+                }
+            }
             wake();
         }
     }

@@ -13,6 +13,8 @@
 //! - `ECSN_LOG`: the most detailed log level of the node (`info` by default).
 //!
 //! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to the peer.
+//! The display shows the step the firmware is at while it starts, then the node's state, redrawn
+//! every second.
 //!
 //! Ethernet needs the board modified: with the default solder bridges, PC1 is both ETH_MDC and
 //! SAI4_D1 of the digital microphones.
@@ -22,21 +24,29 @@
 
 extern crate alloc;
 
+mod display;
+mod gui;
 mod log;
 mod mpu;
 mod qspi;
+mod screen;
 mod sdram;
+mod text;
 
+use alloc::format;
+use core::cell::Cell;
 use core::mem::MaybeUninit;
 use core::net::SocketAddrV4;
 use core::str::FromStr;
 
 use bitcoin::Network;
 use defmt::{error, info, unwrap, warn, Debug2Format};
+use display::Display;
 use ecsn::node::{Config, Node};
 use ecsn::p2p::Connection;
 use ecsn::store::{FlashChainStore, MemChainStore};
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Stack, StackResources};
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
@@ -45,9 +55,10 @@ use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::peripherals::{ETH, ETH_SMA};
 use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::{bind_interrupts, eth, peripherals, SharedData};
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_alloc::TlsfHeap;
 use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
+use screen::Screen;
 use static_cell::StaticCell;
 use stm32_fmc::devices::is42s32800g_6::Is42s32800g;
 use {defmt_rtt as _, panic_probe as _};
@@ -90,6 +101,17 @@ async fn blink(mut led: Output<'static>) -> ! {
     }
 }
 
+/// Shows the step the firmware is at on the start screen, with details under it.
+async fn show_step(screen: &mut Option<Screen>, step: &str, details: &[&str]) {
+    if let Some(screen) = screen {
+        let network = NETWORK.unwrap_or("regtest");
+        let uptime = Instant::now().as_secs();
+        screen
+            .draw(|ui: screen::Ui<'_>| gui::start(ui, network, step, details, uptime))
+            .await;
+    }
+}
+
 fn network() -> Network {
     match NETWORK.unwrap_or("regtest") {
         "bitcoin" => Network::Bitcoin,
@@ -119,6 +141,15 @@ async fn main(spawner: Spawner) {
             divp: Some(PllDiv::DIV2), // 400 MHz
             divq: Some(PllDiv::DIV4),
             divr: Some(PllDiv::DIV2),
+        });
+        // the LTDC's pixel clock: 25 / 5 × 132 / 24 = 27.5 MHz
+        config.rcc.pll3 = Some(Pll {
+            source: PllSource::HSE,
+            prediv: PllPreDiv::DIV5,
+            mul: PllMul::MUL132,
+            divp: Some(PllDiv::DIV2),
+            divq: Some(PllDiv::DIV2),
+            divr: Some(PllDiv::DIV24),
         });
         config.rcc.sys = Sysclk::PLL1_P;
         config.rcc.ahb_pre = AHBPrescaler::DIV2; // 200 MHz, the FMC's clock: SDRAM at 100 MHz
@@ -217,6 +248,24 @@ async fn main(spawner: Spawner) {
     info!("SDRAM: {=usize} MB of heap", sdram::SIZE >> 20);
     log::init();
 
+    let mut screen = match Display::new(
+        Output::new(p.PG3, Level::High, Speed::Low),
+        Output::new(p.PJ12, Level::Low, Speed::Low),
+        p.LTDC,
+        p.DSIHOST,
+    )
+    .await
+    {
+        Ok(display) => {
+            info!("display: {}", display.controller);
+            Some(Screen::new(display))
+        }
+        Err(e) => {
+            warn!("display: {}", e);
+            None
+        }
+    };
+
     let mut rng = Rng::new(p.RNG, Irqs);
     let seed = rng.next_u64();
     let nonce = rng.next_u64();
@@ -250,6 +299,13 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(unwrap!(net_task(runner)));
     info!("Ethernet: MAC {:02x}, waiting for DHCP", mac);
+    let mac_line = gui::mac_text(mac);
+    show_step(
+        &mut screen,
+        "Waiting for an address (DHCP)",
+        &[mac_line.as_str()],
+    )
+    .await;
     stack.wait_config_up().await;
     if let Some(v4) = stack.config_v4() {
         info!("Ethernet: {}", v4.address);
@@ -271,18 +327,17 @@ async fn main(spawner: Spawner) {
         },
     };
     let now: i64 = BUILD_TIME.parse().unwrap_or(0);
+    let link = Link {
+        stack,
+        peer,
+        mac,
+        nonce,
+        now,
+        connected,
+    };
     if RAM_STORE {
         info!("chain store: RAM");
-        follow(
-            stack,
-            MemChainStore::new(),
-            config,
-            nonce,
-            peer,
-            now,
-            connected,
-        )
-        .await
+        follow(MemChainStore::new(), None, config, link, screen).await
     }
 
     let flash = match qspi::QspiFlash::new(
@@ -292,6 +347,12 @@ async fn main(spawner: Spawner) {
         Err(e) => defmt::panic!("QSPI flash: {}", e),
     };
     info!("QSPI flash: mounting the chain store (formatting a flash without one takes minutes)");
+    show_step(
+        &mut screen,
+        "Mounting the chain store",
+        &["a flash without one is formatted first:", "a few minutes"],
+    )
+    .await;
     let store = match FlashChainStore::mount(flash, network, true) {
         Ok((store, formatted)) => {
             info!(
@@ -304,53 +365,131 @@ async fn main(spawner: Spawner) {
         }
         Err(e) => defmt::panic!("QSPI flash: {}", Debug2Format(&e)),
     };
-    follow(stack, store, config, nonce, peer, now, connected).await
+    let capacity = store.layout().records;
+    follow(store, Some(capacity), config, link, screen).await
 }
 
-/// Runs the node on `store` against the peer, reconnecting when the connection ends.
-async fn follow<S: ChainStore>(
+/// The network side of the node: the stack, the peer, what the `version` message needs, and
+/// LD2.
+struct Link {
     stack: Stack<'static>,
-    store: S,
-    config: Config,
-    nonce: u64,
     peer: SocketAddrV4,
+    mac: [u8; 6],
+    nonce: u64,
+    /// Unix time, seconds.
     now: i64,
-    mut connected: Output<'static>,
+    connected: Output<'static>,
+}
+
+/// Runs the node on `store` against the peer, reconnecting when the connection ends, and shows
+/// its state on the display. `capacity`: the headers the flash has room for.
+async fn follow<S: ChainStore>(
+    store: S,
+    capacity: Option<u32>,
+    config: Config,
+    link: Link,
+    screen: Option<Screen>,
 ) -> ! {
     let network = config.network;
+    let Link {
+        stack,
+        peer,
+        mac,
+        nonce,
+        now,
+        mut connected,
+    } = link;
     let node = match Node::new(store, config, nonce) {
         Ok(node) => node,
         Err(e) => defmt::panic!("chain: {}", Debug2Format(&e)),
     };
+    let state = Cell::new(gui::Link::Connecting);
 
     static RX: StaticCell<[u8; 32 * 1024]> = StaticCell::new();
     static TX: StaticCell<[u8; 8 * 1024]> = StaticCell::new();
     let rx = RX.init([0; 32 * 1024]);
     let tx = TX.init([0; 8 * 1024]);
-    loop {
-        let mut socket = TcpSocket::new(stack, &mut rx[..], &mut tx[..]);
-        // the peer pings every few minutes
-        socket.set_timeout(Some(Duration::from_secs(600)));
-        socket.set_keep_alive(Some(Duration::from_secs(60)));
-        info!("peer {}: connecting", Debug2Format(&peer));
-        if let Err(e) = socket.connect(peer).await {
-            warn!("peer {}: {}", Debug2Format(&peer), e);
-        } else {
-            connected.set_low();
-            let mut conn = Connection::new(socket, network);
-            if let Err(e) = node.run(&mut conn, now).await {
-                error!("peer {}: {}", Debug2Format(&peer), Debug2Format(&e));
+    let connection = async {
+        loop {
+            let mut socket = TcpSocket::new(stack, &mut rx[..], &mut tx[..]);
+            // the peer pings every few minutes
+            socket.set_timeout(Some(Duration::from_secs(600)));
+            socket.set_keep_alive(Some(Duration::from_secs(60)));
+            info!("peer {}: connecting", Debug2Format(&peer));
+            state.set(gui::Link::Connecting);
+            if let Err(e) = socket.connect(peer).await {
+                warn!("peer {}: {}", Debug2Format(&peer), e);
+            } else {
+                connected.set_low();
+                state.set(gui::Link::Connected);
+                let mut conn = Connection::new(socket, network);
+                if let Err(e) = node.run(&mut conn, now).await {
+                    error!("peer {}: {}", Debug2Format(&peer), Debug2Format(&e));
+                }
+                connected.set_high();
             }
-            connected.set_high();
+            state.set(gui::Link::Lost);
+            if let Ok((height, hash)) = node.chain().get_best_block() {
+                info!(
+                    "validated {=u32}, best header {=u32} {}",
+                    node.chain().get_validation_index().unwrap_or(0),
+                    height,
+                    Debug2Format(&hash)
+                );
+            }
+            Timer::after_secs(5).await;
         }
-        if let Ok((height, hash)) = node.chain().get_best_block() {
-            info!(
-                "validated {=u32}, best header {=u32} {}",
-                node.chain().get_validation_index().unwrap_or(0),
-                height,
-                Debug2Format(&hash)
-            );
+    };
+    let dashboard = async {
+        let Some(mut screen) = screen else {
+            return core::future::pending::<()>().await;
+        };
+        let peer_text = format!("{peer}");
+        let network_name = NETWORK.unwrap_or("regtest");
+        // the peer's clock at its handshake, and ours then
+        let mut clock: Option<(i64, Instant)> = None;
+        let mut connections = 0;
+        loop {
+            let status = node.status();
+            if status.connections != connections {
+                connections = status.connections;
+                if let Some(peer) = &status.peer {
+                    clock = Some((peer.time, Instant::now()));
+                }
+            }
+            let chain = node.chain();
+            let best_header = chain.get_best_block().map_or(0, |(height, _)| height);
+            let validated = chain.get_validation_index().unwrap_or(0);
+            let tip = chain.get_block_hash(validated).ok().and_then(|hash| {
+                let header = chain.get_block_header(&hash).ok()?;
+                Some((format!("{hash}"), header.time))
+            });
+            let acc = chain.acc();
+            let view = gui::Dashboard {
+                network: network_name,
+                clock: clock.map(|(time, at)| time + at.elapsed().as_secs() as i64),
+                uptime: Instant::now().as_secs(),
+                address: stack.config_v4().map(|v4| format!("{}", v4.address)),
+                mac,
+                peer: &peer_text,
+                link: state.get(),
+                status: &status,
+                best_header,
+                validated,
+                tip,
+                assumed: node.config().assume_utreexo.as_ref().map(|a| a.height),
+                leaves: acc.leaves,
+                roots: acc.roots.len(),
+                capacity,
+                // `TlsfHeap::used` borrows the heap twice and panics
+                heap: (sdram::SIZE - HEAP.free(), sdram::SIZE),
+            };
+            screen
+                .draw(|ui: screen::Ui<'_>| gui::dashboard(ui, &view))
+                .await;
+            Timer::after_secs(1).await;
         }
-        Timer::after_secs(5).await;
-    }
+    };
+    join(connection, dashboard).await;
+    defmt::unreachable!()
 }

@@ -1,6 +1,6 @@
-//! The window (BLIT): the board with its four user LEDs, its network
-//! address, the chain's validated tip, the emulation's pace and a RESET
-//! button, next to the firmware's logs.
+//! The window (BLIT): the board's display at its size, under it the board
+//! with its four user LEDs, its network address, the chain's validated tip,
+//! the emulation's pace and a RESET button; the firmware's logs beside them.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,7 @@ use blit::{Animation, AnimationOptions, Sides};
 use blit_desktop::{Application, Config, DesktopContext, EventLoopProxy, Scope, cpu};
 use blit_gui::clip::BoundsClip;
 use blit_gui::color::Color;
+use blit_gui::image::{Image, ImageData, ImageFormat, ImageHandle, ImagePixels, ImageSampling};
 use blit_gui::rectangle::Rectangle;
 use blit_gui::style::{Border, BorderRadius};
 use blit_gui::text::system::{FontStack, TextConfig, TextSystem};
@@ -19,6 +20,8 @@ use blit_gui_widgets::scroll::ScrollState;
 use blit_gui_widgets::scroll::uniform_list::UniformList;
 use blit_text::{Family, FontData};
 
+use crate::board::SCREEN;
+use crate::panel::Controller;
 use crate::session::{Command, Session, Snapshot};
 
 type Ctx = DesktopContext<cpu::Backend>;
@@ -28,8 +31,10 @@ static FONT: &[u8] = include_bytes!(env!("ECSN_EMU_FONT"));
 static FONT_MONO: &[u8] = include_bytes!(env!("ECSN_EMU_FONT_MONO"));
 const MONO: FontId = FontId(1);
 
-const BOARD_WIDTH: f32 = 380.0;
-const SIDE_WIDTH: f32 = 900.0;
+/// The frame around the display.
+const BEZEL: f32 = 16.0;
+const BOARD_WIDTH: f32 = SCREEN.0 as f32 + 2.0 * BEZEL;
+const SIDE_WIDTH: f32 = 560.0;
 const GAP: f32 = 18.0;
 const LOG_LINE: f32 = 16.0;
 const LED_SIZE: f32 = 30.0;
@@ -37,6 +42,7 @@ const LED_SIZE: f32 = 30.0;
 const BACKGROUND: Color = Color::rgb(0x12, 0x14, 0x18);
 const PANEL: Color = Color::rgb(0x1c, 0x1f, 0x26);
 const BOARD: Color = Color::rgb(0x0e, 0x3b, 0x2c);
+const GLASS: Color = Color::rgb(0x05, 0x05, 0x06);
 const TEXT: Color = Color::rgb(0xe6, 0xe8, 0xee);
 const MUTED: Color = Color::rgb(0x9a, 0xa3, 0xb3);
 const ACCENT: Color = Color::rgb(0xf2, 0xc8, 0x1e);
@@ -58,6 +64,7 @@ pub struct Wake;
 struct Launch {
     elf: Vec<u8>,
     qspi: Option<PathBuf>,
+    panel: Controller,
 }
 
 static HANDOFF: Mutex<Option<Launch>> = Mutex::new(None);
@@ -67,6 +74,8 @@ struct App {
     snapshot: Arc<Mutex<Snapshot>>,
     logs_scroll: ScrollState,
     seen_logs: u64,
+    /// The display's picture, and the screen generation it shows.
+    screen: Option<(u64, ImageHandle)>,
 }
 
 fn text(ui: Ui<'_>, text: &str, size: f32, color: Color) {
@@ -103,7 +112,7 @@ impl Application for App {
 
     fn new(proxy: EventLoopProxy<Wake>, _: Scope<Self>, _: &mut Ctx) -> Self {
         let launch = HANDOFF.lock().unwrap().take().expect("emulator handoff");
-        let session = Session::start(launch.elf, launch.qspi, move || {
+        let session = Session::start(launch.elf, launch.qspi, launch.panel, move || {
             let _ = proxy.send_event(Wake);
         });
         let snapshot = session.snapshot.clone();
@@ -112,6 +121,7 @@ impl Application for App {
             snapshot,
             logs_scroll: ScrollState::default(),
             seen_logs: 0,
+            screen: None,
         }
     }
 
@@ -123,29 +133,89 @@ impl Application for App {
         root.insert(Rectangle::new().background(BACKGROUND));
         let reset;
 
-        // The board.
+        // The display, then the board.
         {
-            let mut board = root
+            let mut left = root
                 .child()
                 .item(flex::item().width(Sizing::fixed(BOARD_WIDTH)))
-                .layout(flex::column().gap(14.0))
-                .pad(18.0);
+                .layout(flex::column().gap(14.0));
+            {
+                let mut bezel = left.child().layout(flex::column()).pad(BEZEL);
+                bezel.insert(
+                    Rectangle::new()
+                        .background(GLASS)
+                        .border(Border::solid(2.0, Color::rgb(0x2a, 0x2e, 0x36)))
+                        .radius(BorderRadius::uniform(10.0)),
+                );
+                let screen = &snap.screen;
+                if !screen.frame.rgba.is_empty()
+                    && self
+                        .screen
+                        .as_ref()
+                        .is_none_or(|(generation, _)| *generation != screen.generation)
+                {
+                    let image = bezel
+                        .context_mut()
+                        .create_image(ImageData::new(
+                            ImagePixels::Owned(screen.frame.rgba.clone().into_boxed_slice()),
+                            ImageFormat::Rgba8,
+                            screen.frame.width,
+                            screen.frame.height,
+                        ))
+                        .expect("display image");
+                    self.screen = Some((screen.generation, image));
+                }
+                let mut glass = bezel.child().item(
+                    flex::item()
+                        .width(Sizing::fixed(SCREEN.0 as f32))
+                        .height(Sizing::fixed(SCREEN.1 as f32)),
+                );
+                match &self.screen {
+                    Some((_, image)) => {
+                        glass.insert(Image::new(image).sampling(ImageSampling::Nearest))
+                    }
+                    None => glass.insert(Rectangle::new().background(Color::rgb(0, 0, 0))),
+                }
+            }
+            let mut board = left
+                .child()
+                .item(flex::item().width(Sizing::fixed(BOARD_WIDTH)))
+                .layout(flex::row().gap(28.0).align(Align::Center))
+                .pad(16.0);
             board.insert(
                 Rectangle::new()
                     .background(BOARD)
                     .border(Border::solid(2.0, Color::rgb(0x1f, 0x5e, 0x47)))
                     .radius(BorderRadius::uniform(10.0)),
             );
-            board
-                .child()
-                .build(|ui: Ui<'_>| text(ui, "STM32H747I-DISCO", 20.0, ACCENT));
-            for line in [
-                "STM32H747XI (Cortex-M7 at 400 MHz)",
-                "32 MB SDRAM, 2 × MT25QL512 QSPI, LAN8742A",
-            ] {
-                board
+            {
+                let mut about = board.child().layout(flex::column().gap(6.0));
+                about
                     .child()
-                    .build(|ui: Ui<'_>| text(ui, line, 12.0, MUTED));
+                    .build(|ui: Ui<'_>| text(ui, "STM32H747I-DISCO", 20.0, ACCENT));
+                for line in [
+                    "STM32H747XI (Cortex-M7 at 400 MHz)",
+                    "32 MB SDRAM, 2 × MT25QL512 QSPI, LAN8742A",
+                ] {
+                    about
+                        .child()
+                        .build(|ui: Ui<'_>| text(ui, line, 12.0, MUTED));
+                }
+                let pace = format!(
+                    "{:.1} s virtual, ×{:.2} real time, {:.0} MIPS, asleep {:.0} %",
+                    snap.virtual_s,
+                    snap.speed,
+                    snap.mips,
+                    100.0 * snap.asleep
+                );
+                about
+                    .child()
+                    .build(|ui: Ui<'_>| text(ui, &pace, 12.0, MUTED));
+                if let Some(stopped) = &snap.stopped {
+                    about
+                        .child()
+                        .build(|ui: Ui<'_>| text(ui, stopped, 13.0, Color::rgb(0xff, 0x6b, 0x6b)));
+                }
             }
             {
                 let mut leds = board.child().layout(flex::row().gap(22.0));
@@ -168,30 +238,16 @@ impl Application for App {
                     led.child().build(|ui: Ui<'_>| text(ui, label, 12.0, TEXT));
                 }
             }
+            let mut state = board.child().layout(flex::column().gap(8.0));
             let address = snap.address.as_deref().unwrap_or("waiting for DHCP");
-            board
+            state
                 .child()
                 .build(|ui: Ui<'_>| text(ui, &format!("Ethernet: {address}"), 14.0, TEXT));
             let validated = snap.validated.as_deref().unwrap_or("-");
-            board
+            state
                 .child()
                 .build(|ui: Ui<'_>| text(ui, &format!("Validated up to: {validated}"), 14.0, TEXT));
-            let pace = format!(
-                "{:.1} s virtual, ×{:.2} real time, {:.0} MIPS, asleep {:.0} %",
-                snap.virtual_s,
-                snap.speed,
-                snap.mips,
-                100.0 * snap.asleep
-            );
-            board
-                .child()
-                .build(|ui: Ui<'_>| text(ui, &pace, 12.0, MUTED));
-            if let Some(stopped) = &snap.stopped {
-                board
-                    .child()
-                    .build(|ui: Ui<'_>| text(ui, stopped, 13.0, Color::rgb(0xff, 0x6b, 0x6b)));
-            }
-            reset = board.child().build(|ui: Ui<'_>| button(ui, "RESET"));
+            reset = state.child().build(|ui: Ui<'_>| button(ui, "RESET"));
         }
 
         // The logs.
@@ -265,7 +321,7 @@ impl Application for App {
 
 /// Opens the window with the board running `elf`, and stops the board, which
 /// saves its flash image, when the window closes.
-pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>) {
+pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>, panel: Controller) {
     let text = TextSystem::new(
         TextConfig {
             fonts: vec![
@@ -287,11 +343,11 @@ pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>) {
     )
     .expect("text system");
     let graphics = cpu::Backend::new(text, cpu::Config::default());
-    *HANDOFF.lock().unwrap() = Some(Launch { elf, qspi });
+    *HANDOFF.lock().unwrap() = Some(Launch { elf, qspi, panel });
     blit_desktop::run::<App>(Config {
         title: "STM32H747I-DISCO emulator".into(),
         width: (BOARD_WIDTH + SIDE_WIDTH + 3.0 * GAP) as u32,
-        height: 720,
+        height: 730,
         graphics,
     })
     .expect("window");

@@ -98,9 +98,22 @@ Optional build-time settings:
 - `ECSN_RAM_STORE`: set it to keep the chain in RAM instead of on the QSPI flash.
 - `ECSN_LOG`: the log level, `info` by default.
 
+The display is drawn with BLIT, taken by path from `../upstream/blit`: a checkout of
+https://github.com/nicoburniske/blit with `blit-widget` built without `std` (branch `local/no-std`
+there). Its glyphs are rendered at build time from the DejaVu fonts in the directory `ECSN_FONTS`,
+which the devenv sets.
+
 The peer must accept the board's connection: run utreexod with `--listen` on a LAN address, not
 `127.0.0.1`. LD1 (green) blinks while the firmware runs. LD2 (orange) is on while it is
 connected.
+
+The 4" display (800 × 480, MIPI DSI) shows, drawn with BLIT, the step the firmware is at while it
+starts (DHCP, the chain store), then the node, redrawn every second: the validated height out of the best header with
+its progress, the validated tip (hash, time, age, transactions, inputs proven, size), the node's
+phase, the peer (address, user agent, height), the board's address and MAC, the flash and heap in
+use, the accumulator. The clock is the peer's, taken from its `version` message: the board has no
+clock set. The firmware tells the panel's controller (OTM8009A on the first boards, NT35510 on later
+ones) from its ID, and runs without the display if neither answers.
 
 The board's Ethernet needs a hardware change. With the default solder bridges, PC1 is both
 ETH_MDC and SAI4_D1 of the digital microphones (UM2411). Zephyr's documentation of the board
@@ -115,7 +128,9 @@ data among it) and takes up to a few minutes.
 `ecsn-emu-disco` runs the firmware's ELF on the STM32H7 of `../emulator/stm32h7-rax` with the
 DISCO's 32 MB SDRAM, its two MT25QL512 (128 MB in dual-flash mode, kept in a file across runs with
 `--qspi`), its LAN8742A and a network behind it: esp32s3-rax's router, with DHCP, DNS and NAT, where
-the gateway 10.0.2.2 is the host's 127.0.0.1. The firmware is built with that peer:
+the gateway 10.0.2.2 is the host's 127.0.0.1; and its display: the panel on the DSI link (an
+OTM8009A, `--panel nt35510` for the later controller) showing what the LTDC sends while the panel is
+awake and on and its backlight lit. The firmware is built with that peer:
 
 ```
 cd firmware && ECSN_PEER=10.0.2.2:18444 cargo build --release    # utreexod on the host, port 18444
@@ -123,8 +138,9 @@ cd ../ecsn-emu-disco && cargo run --release -- --qspi /tmp/disco.img            
 cargo run --release -- --headless --seconds 30 --realtime --qspi /tmp/disco.img  # logs on stdout
 ```
 
-The window shows the four LEDs, the address, the validated tip, the pace and a RESET button next to
-the decoded defmt logs. Headless: `--realtime` keeps virtual time no faster than the wall clock (for
+The window shows the display at its size, under it the four LEDs, the address, the validated tip,
+the pace and a RESET button, beside the decoded defmt logs. Headless: `--screen-png FILE` saves what
+the display shows at the end, `--realtime` keeps virtual time no faster than the wall clock (for
 real peers; a board fallen behind, its core busy, does not catch up), `--profile SECONDS` samples
 the PC every millisecond and prints the busiest functions with their callers for each interval of
 that many seconds, and for the whole run at the end, `--trace` prints the PC and the core clock
@@ -151,4 +167,5 @@ ends a headless run as `--seconds` does: the statistics, the profile, the QSPI i
   peer. The emulator found four bugs of the node, fixed with their tests: an early header
   announcement taken for the answer to `getheaders`, a block announced during a sync forgotten, a
   reset during the header sync forcing a reindex of the whole chain, and a header sync idling
-  between batches (now pipelined, 5 times faster on the board).
+  between batches (now pipelined, 5 times faster on the board). Its display works there too, with
+  either controller.

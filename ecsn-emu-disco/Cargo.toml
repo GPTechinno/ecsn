@@ -16,6 +16,7 @@ stm32h7-rax = { path = "../../emulator/stm32h7-rax" }
 esp32s3-rax = { path = "../../emulator/esp32s3-rax" }
 defmt-decoder = "1.2"
 goblin = "0.10"
+png = "0.18"
 rustc-demangle = "0.1"
 ctrlc = { version = "3", features = ["termination"] }
 clap = { version = "4", features = ["derive"] }

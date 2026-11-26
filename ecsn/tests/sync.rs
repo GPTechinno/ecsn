@@ -5,7 +5,7 @@ mod common;
 
 use bitcoin::Network;
 use common::{fixture, mine_headers, Fixture, Shared};
-use ecsn::node::{Config, Node};
+use ecsn::node::{Config, Node, Phase};
 use ecsn::p2p::{
     services, Connection, Message, NetAddress, UtreexoProof, Version, MAX_HEADERS, PROTOCOL_VERSION,
 };
@@ -117,6 +117,18 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
     let roots: Vec<String> = acc.roots.iter().map(ToString::to_string).collect();
     assert_eq!(roots, fixture.roots);
     assert_eq!(asked.iter().sum::<usize>(), 111);
+
+    let status = node.status();
+    assert_eq!(status.phase, Phase::Following);
+    let peer = status.peer.unwrap();
+    assert_eq!((peer.user_agent.as_str(), peer.height), ("/fixture/", 111));
+    assert_eq!(status.connections, 1);
+    assert_eq!(status.validated, 111);
+    let last = status.last_block.unwrap();
+    assert_eq!(last.height, 111);
+    assert_eq!(last.hash, fixture.blocks[110].block_hash());
+    assert_eq!(last.transactions, fixture.blocks[110].txdata.len());
+    assert_eq!(last.inputs, fixture.leaf_data.len());
     asked
 }
 
@@ -234,6 +246,12 @@ fn a_block_announced_during_a_sync_is_followed() {
             .expect("the node waited for an announcement it already had");
     });
     assert_eq!(node.chain().get_validation_index().unwrap(), 111);
+    // the connection ended
+    let status = node.status();
+    assert_eq!(status.phase, Phase::Idle);
+    assert!(status.peer.is_none());
+    assert_eq!(status.connections, 1);
+    assert_eq!(status.last_block.map(|b| b.height), Some(111));
 }
 
 /// Sends a full batch of headers, then hangs up at the next `getheaders`.

@@ -1,12 +1,14 @@
 //! Runs the ECSN firmware on an emulated STM32H747I-DISCO, in a window (the
-//! board's LEDs and state, the firmware's logs), or headless with
+//! board's display, LEDs and state, the firmware's logs), or headless with
 //! `--headless`: the firmware's logs, the emulator's notes and the network
-//! events go to stdout, then the virtual and real time taken.
+//! events go to stdout, then the virtual and real time taken (and with
+//! `--screen-png`, what the display shows goes to a PNG).
 
 mod board;
 mod gui;
 mod logs;
 mod pace;
+mod panel;
 mod phy;
 mod profile;
 mod session;
@@ -22,6 +24,7 @@ use stm32h7_rax::Event;
 
 use board::Disco;
 use pace::Pace;
+use panel::Controller;
 use profile::Profile;
 
 const PS_PER_S: u64 = 1_000_000_000_000;
@@ -60,6 +63,13 @@ struct Args {
     /// start:end in hexadecimal (for example 58024400:58024800, the RCC)
     #[arg(long, value_parser = parse_range)]
     mmio_trace: Option<(u32, u32)>,
+    /// The display's controller: the OTM8009A of the first boards, or the
+    /// NT35510 of later ones; `none` for no panel on the DSI link
+    #[arg(long, value_enum, default_value = "otm8009a")]
+    panel: Controller,
+    /// Save what the display shows as a PNG at the end of a headless run
+    #[arg(long, value_name = "PNG")]
+    screen_png: Option<PathBuf>,
 }
 
 fn parse_range(text: &str) -> Result<(u32, u32), String> {
@@ -79,10 +89,10 @@ fn main() -> ExitCode {
         }
     };
     if !args.headless {
-        gui::run(elf, args.qspi);
+        gui::run(elf, args.qspi, args.panel);
         return ExitCode::SUCCESS;
     }
-    let mut disco = match Disco::new(&elf, args.qspi.as_deref()) {
+    let mut disco = match Disco::new(&elf, args.qspi.as_deref(), args.panel) {
         Ok(disco) => disco,
         Err(e) => {
             eprintln!("{e}");
@@ -171,6 +181,11 @@ fn main() -> ExitCode {
     );
     if let Err(e) = disco.save_qspi() {
         eprintln!("QSPI image: {e}");
+    }
+    if let Some(path) = &args.screen_png
+        && let Err(e) = disco.save_screen(path)
+    {
+        eprintln!("screen: {e}");
     }
     if failed {
         ExitCode::FAILURE

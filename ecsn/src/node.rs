@@ -9,7 +9,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network};
@@ -47,6 +47,62 @@ pub struct Config {
 const FLUSH_EVERY: u32 = 100;
 /// Validated heights between two progress lines while syncing.
 const PROGRESS_EVERY: u32 = 1000;
+
+/// What the node is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    /// No connection to a peer.
+    #[default]
+    Idle,
+    /// Exchanging `version` and `verack`.
+    Handshake,
+    Headers,
+    /// Taking the configured accumulator as valid.
+    Assume,
+    Blocks,
+    /// Synced, waiting for new blocks.
+    Following,
+}
+
+/// The peer's `version` message.
+#[derive(Clone, Debug)]
+pub struct PeerInfo {
+    pub user_agent: String,
+    pub version: u32,
+    pub services: u64,
+    /// Its best height when it connected.
+    pub height: i32,
+    /// Its time when it connected, Unix seconds.
+    pub time: i64,
+}
+
+/// A block validated.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockInfo {
+    pub height: u32,
+    pub hash: BlockHash,
+    /// Its header's time, Unix seconds.
+    pub time: u32,
+    pub transactions: usize,
+    /// The inputs its Utreexo proof proves.
+    pub inputs: usize,
+    /// Its serialized size, bytes.
+    pub size: usize,
+}
+
+/// What the node is doing and what it did since it started, for a display.
+#[derive(Clone, Debug, Default)]
+pub struct Status {
+    pub phase: Phase,
+    /// The peer, once its handshake is done, until the connection ends.
+    pub peer: Option<PeerInfo>,
+    /// Handshakes done, which tells connections apart.
+    pub connections: u32,
+    /// The last block validated.
+    pub last_block: Option<BlockInfo>,
+    /// Blocks validated.
+    pub validated: u32,
+}
 
 /// A block asked for, until it is validated.
 struct InFlight {
@@ -86,6 +142,7 @@ pub struct Node<S: ChainStore> {
     nonce: u64,
     /// A block was announced while syncing: sync again.
     news: Cell<bool>,
+    status: RefCell<Status>,
 }
 
 impl<S: ChainStore> Node<S> {
@@ -97,11 +154,25 @@ impl<S: ChainStore> Node<S> {
             config,
             nonce,
             news: Cell::new(false),
+            status: RefCell::new(Status::default()),
         })
     }
 
     pub fn chain(&self) -> &ChainState<S> {
         &self.chain
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// What the node is doing.
+    pub fn status(&self) -> Status {
+        self.status.borrow().clone()
+    }
+
+    fn set_phase(&self, phase: Phase) {
+        self.status.borrow_mut().phase = phase;
     }
 
     /// Exchanges `version` and `verack` with the peer. `now` is the Unix time in seconds.
@@ -110,6 +181,7 @@ impl<S: ChainStore> Node<S> {
         conn: &mut Connection<T>,
         now: i64,
     ) -> Result<Version, Error<T::Error>> {
+        self.set_phase(Phase::Handshake);
         let (height, _) = self.chain.get_best_block()?;
         conn.send(&Message::Version(Version {
             version: PROTOCOL_VERSION,
@@ -144,6 +216,15 @@ impl<S: ChainStore> Node<S> {
                 if version.services & services::UTREEXO == 0 {
                     warn!("the peer serves no Utreexo proofs");
                 }
+                let mut status = self.status.borrow_mut();
+                status.peer = Some(PeerInfo {
+                    user_agent: version.user_agent.clone(),
+                    version: version.version,
+                    services: version.services,
+                    height: version.start_height,
+                    time: version.timestamp,
+                });
+                status.connections += 1;
                 return Ok(version.clone());
             }
         }
@@ -156,6 +237,7 @@ impl<S: ChainStore> Node<S> {
         &self,
         conn: &mut Connection<T>,
     ) -> Result<u32, Error<T::Error>> {
+        self.set_phase(Phase::Headers);
         let locator = self.chain.get_block_locator().inspect_err(|e| {
             warn!("block locator: {e:?}");
         })?;
@@ -233,6 +315,7 @@ impl<S: ChainStore> Node<S> {
             leaves: assumed.leaves,
             roots: assumed.roots.clone(),
         };
+        self.set_phase(Phase::Assume);
         self.chain.mark_chain_as_assumed(acc, assumed.block_hash)?;
         info!(
             "assumed the accumulator of block {} {}",
@@ -249,6 +332,7 @@ impl<S: ChainStore> Node<S> {
         &self,
         conn: &mut Connection<T>,
     ) -> Result<u32, Error<T::Error>> {
+        self.set_phase(Phase::Blocks);
         let window = self.config.blocks_in_flight.max(1);
         let (best, _) = self.chain.get_best_block()?;
         let mut asked = self.chain.get_validation_index()?;
@@ -366,8 +450,9 @@ impl<S: ChainStore> Node<S> {
     ) -> Result<(), BlockchainError> {
         // `ChainState::connect_block` takes the validated tip again and adds its outputs to the
         // accumulator a second time
+        let hash = block.block_hash();
         if height != self.chain.get_validation_index()? + 1
-            || self.chain.get_block_hash(height)? != block.block_hash()
+            || self.chain.get_block_hash(height)? != hash
         {
             return Err(BlockchainError::BlockValidation(
                 BlockValidationErrors::BlockDoesntExtendTip,
@@ -381,12 +466,34 @@ impl<S: ChainStore> Node<S> {
             |h| self.chain.get_mtp_by_height(h),
         )?;
         self.chain.connect_block(block, proof, inputs, del_hashes)?;
+        let mut status = self.status.borrow_mut();
+        status.last_block = Some(BlockInfo {
+            height,
+            hash,
+            time: block.header.time,
+            transactions: block.txdata.len(),
+            inputs: leaf_data.len(),
+            size: block.total_size(),
+        });
+        status.validated += 1;
         Ok(())
     }
 
     /// Syncs headers and blocks with the peer, then follows its new blocks. Returns only on an
     /// error.
     pub async fn run<T: Read + Write>(
+        &self,
+        conn: &mut Connection<T>,
+        now: i64,
+    ) -> Result<(), Error<T::Error>> {
+        let result = self.run_connected(conn, now).await;
+        let mut status = self.status.borrow_mut();
+        status.phase = Phase::Idle;
+        status.peer = None;
+        result
+    }
+
+    async fn run_connected<T: Read + Write>(
         &self,
         conn: &mut Connection<T>,
         now: i64,
@@ -434,6 +541,7 @@ impl<S: ChainStore> Node<S> {
         let height = self.sync_blocks(conn).await?;
         self.chain.update_ibd(IBDState::Done);
         self.chain.flush()?;
+        self.set_phase(Phase::Following);
         info!("validated up to {height}");
         Ok(height)
     }
