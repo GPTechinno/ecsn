@@ -20,10 +20,11 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 | `ecsn-emu-disco` | the STM32H747I-DISCO emulated (`emulator/stm32h7-rax` with the board around it), to run and debug the firmware: a BLIT window or headless. Its own workspace, built from its directory with BLIT's nightly Rust |
 | `ecsn-firmware` (`firmware/`) | the node on an STM32H747I-DISCO (Cortex-M7): embassy, Ethernet with DHCP, the 32 MB SDRAM as the heap, the chain on the 128 MB QSPI flash. Its own workspace, built from its directory |
 
-`floresta-chain` comes by git from the `perf-chain-walks` branch of the fork
+`floresta-chain` comes by git from the `perf-header-sync` branch of the fork
 [GPTechinno/Floresta](https://github.com/GPTechinno/Floresta): upstream's `master`, which builds it
-without `std` since getfloresta/Floresta#1501, and its walks back along the chain that no longer hash
-headers, not upstream yet.
+without `std` since getfloresta/Floresta#1501, its walks back along the chain that no longer hash
+headers (branch `perf-chain-walks`), and its header acceptance hashing each header once, not
+upstream yet.
 
 ## Environment
 

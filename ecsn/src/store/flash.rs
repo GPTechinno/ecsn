@@ -898,6 +898,55 @@ fn block_header(magic: u32, seq: u32) -> [u8; BLOCK_HEADER_SIZE as usize] {
     header
 }
 
+impl<F: Flash> FlashChainStore<F> {
+    /// Saves `header`, whose hash is `hash` when the caller has it, else hashed here.
+    fn save(
+        &mut self,
+        header: &DiskBlockHeader,
+        hash: Option<BlockHash>,
+    ) -> Result<(), ChainstoreError> {
+        let (state, height) = match *header {
+            DiskBlockHeader::FullyValid(_, h) => (FULLY_VALID, Some(h)),
+            DiskBlockHeader::AssumedValid(_, h) => (ASSUMED_VALID, Some(h)),
+            DiskBlockHeader::Orphan(_) => (ORPHAN, None),
+            DiskBlockHeader::HeadersOnly(_, h) => (HEADERS_ONLY, Some(h)),
+            DiskBlockHeader::InFork(_, h) => (IN_FORK, Some(h)),
+            DiskBlockHeader::InvalidChain(_) => (INVALID, None),
+        };
+        // a header just read (as when walking down the chain) is not hashed again
+        let stored = match self.last_read.get() {
+            Some((r, last)) if last == **header => Some(r),
+            _ => None,
+        };
+        let (r, appended) = match stored {
+            Some(r) => (r, false),
+            None => {
+                let hash = hash.unwrap_or_else(|| header.block_hash());
+                match self.find(&hash)? {
+                    Some(r) => (r, false),
+                    None => (self.append(header, height, &hash)?, true),
+                }
+            }
+        };
+        if !appended && height.is_some() && self.height_of(r)? != height {
+            return Err(ChainstoreError::Other(format!(
+                "header {} saved at another height than stored",
+                self.record_hash(r)?
+            )));
+        }
+        let invalid = self.invalid.contains(&r);
+        if state == INVALID && !invalid {
+            self.journal_append(ENTRY_INVALID, &r.to_le_bytes())?;
+            self.invalid.insert(r);
+        } else if state != INVALID && invalid {
+            self.journal_append(ENTRY_VALID, &r.to_le_bytes())?;
+            self.invalid.remove(&r);
+        }
+        self.states[r as usize] = state;
+        Ok(())
+    }
+}
+
 impl<F: Flash> ChainStore for FlashChainStore<F> {
     type Error = ChainstoreError;
 
@@ -943,45 +992,15 @@ impl<F: Flash> ChainStore for FlashChainStore<F> {
     }
 
     fn save_header(&mut self, header: &DiskBlockHeader) -> Result<(), Self::Error> {
-        let (state, height) = match *header {
-            DiskBlockHeader::FullyValid(_, h) => (FULLY_VALID, Some(h)),
-            DiskBlockHeader::AssumedValid(_, h) => (ASSUMED_VALID, Some(h)),
-            DiskBlockHeader::Orphan(_) => (ORPHAN, None),
-            DiskBlockHeader::HeadersOnly(_, h) => (HEADERS_ONLY, Some(h)),
-            DiskBlockHeader::InFork(_, h) => (IN_FORK, Some(h)),
-            DiskBlockHeader::InvalidChain(_) => (INVALID, None),
-        };
-        // a header just read (as when walking down the chain) is not hashed again
-        let stored = match self.last_read.get() {
-            Some((r, last)) if last == **header => Some(r),
-            _ => None,
-        };
-        let (r, appended) = match stored {
-            Some(r) => (r, false),
-            None => {
-                let hash = header.block_hash();
-                match self.find(&hash)? {
-                    Some(r) => (r, false),
-                    None => (self.append(header, height, &hash)?, true),
-                }
-            }
-        };
-        if !appended && height.is_some() && self.height_of(r)? != height {
-            return Err(ChainstoreError::Other(format!(
-                "header {} saved at another height than stored",
-                self.record_hash(r)?
-            )));
-        }
-        let invalid = self.invalid.contains(&r);
-        if state == INVALID && !invalid {
-            self.journal_append(ENTRY_INVALID, &r.to_le_bytes())?;
-            self.invalid.insert(r);
-        } else if state != INVALID && invalid {
-            self.journal_append(ENTRY_VALID, &r.to_le_bytes())?;
-            self.invalid.remove(&r);
-        }
-        self.states[r as usize] = state;
-        Ok(())
+        self.save(header, None)
+    }
+
+    fn save_header_with_hash(
+        &mut self,
+        header: &DiskBlockHeader,
+        hash: BlockHash,
+    ) -> Result<(), Self::Error> {
+        self.save(header, Some(hash))
     }
 
     fn get_block_hash(&self, height: u32) -> Result<Option<BlockHash>, Self::Error> {
