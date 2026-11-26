@@ -20,8 +20,10 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 | `ecsn-emu-disco` | the STM32H747I-DISCO emulated (`emulator/stm32h7-rax` with the board around it), to run and debug the firmware: a BLIT window or headless. Its own workspace, built from its directory with BLIT's nightly Rust |
 | `ecsn-firmware` (`firmware/`) | the node on an STM32H747I-DISCO (Cortex-M7): embassy, Ethernet with DHCP, the 32 MB SDRAM as the heap, the chain on the 128 MB QSPI flash. Its own workspace, built from its directory |
 
-`floresta-chain` comes by path from `../bitcoin/Floresta`, branch `floresta-chain-no-std`, which builds it
-without `std` (getfloresta/Floresta#1498).
+`floresta-chain` comes by git from the `perf-chain-walks` branch of the fork
+[GPTechinno/Floresta](https://github.com/GPTechinno/Floresta): upstream's `master`, which builds it
+without `std` since getfloresta/Floresta#1501, and its walks back along the chain that no longer hash
+headers, not upstream yet.
 
 ## Environment
 
@@ -31,7 +33,7 @@ devenv (stable Rust, the `thumbv7em-none-eabihf` target, the ARM C compiler for
 ```
 cargo test -p ecsn
 cargo build -p ecsn --target thumbv7em-none-eabihf --release
-cargo fmt -p ecsn -p ecsn-host -p ecsn-regtest   # not --all: it reformats ../bitcoin/Floresta
+cargo fmt --all
 ```
 
 ## Against a regtest bridge node
@@ -98,9 +100,9 @@ Optional build-time settings:
 - `ECSN_RAM_STORE`: set it to keep the chain in RAM instead of on the QSPI flash.
 - `ECSN_LOG`: the log level, `info` by default.
 
-The display is drawn with BLIT, taken by path from `../upstream/blit`: a checkout of
-https://github.com/nicoburniske/blit with `blit-widget` built without `std` (branch `local/no-std`
-there). Its glyphs are rendered at build time from the DejaVu fonts in the directory `ECSN_FONTS`,
+The display is drawn with BLIT, taken by git from the `local/no-std` branch of the fork
+[Georges760/blit](https://github.com/Georges760/blit): https://github.com/nicoburniske/blit with
+`blit-widget` built without `std`. Its glyphs are rendered at build time from the DejaVu fonts in the directory `ECSN_FONTS`,
 which the devenv sets.
 
 The peer must accept the board's connection: run utreexod with `--listen` on a LAN address, not
@@ -125,7 +127,7 @@ data among it) and takes up to a few minutes.
 
 ## The emulated board
 
-`ecsn-emu-disco` runs the firmware's ELF on the STM32H7 of `../emulator/stm32h7-rax` with the
+`ecsn-emu-disco` runs the firmware's ELF on the STM32H7 of [stm32h7-rax](https://github.com/GPTechinno/stm32h7-rax) with the
 DISCO's 32 MB SDRAM, its two MT25QL512 (128 MB in dual-flash mode, kept in a file across runs:
 `$XDG_DATA_HOME/ecsn-emu-disco/qspi.bin`, or `~/.local/share/ecsn-emu-disco/qspi.bin`, another file
 with `--qspi`, none with `--volatile`), its LAN8742A and a network behind it: esp32s3-rax's router, with DHCP, DNS and NAT, where

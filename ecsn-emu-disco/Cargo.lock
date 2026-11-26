@@ -854,6 +854,7 @@ dependencies = [
 [[package]]
 name = "esp32s3-rax"
 version = "0.1.0"
+source = "git+https://github.com/GPTechinno/esp32s3-rax?branch=main#73878aabe74d77d7a657748f83aec6870e5da976"
 dependencies = [
  "aes",
  "clap",
@@ -2654,6 +2655,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stm32h7-rax"
 version = "0.1.0"
+source = "git+https://github.com/GPTechinno/stm32h7-rax?branch=main#46e58d2d453e48d533fbbe0d221169e9bd119ece"
 dependencies = [
  "goblin",
  "rax 0.1.0 (git+https://github.com/Georges760/rax?branch=feat%2Fcortex-m7-fp-data)",

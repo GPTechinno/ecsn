@@ -15,8 +15,9 @@ authors = ["Georges Palauqui <g.palauqui@gptechinno.com>"]
 
 [workspace.dependencies]
 bitcoin = { version = "0.32.8", default-features = false }
-# `bitcoin/Floresta` on its branch `floresta-chain-no-std` (getfloresta/Floresta#1498)
-floresta-chain = { path = "../bitcoin/Floresta/crates/floresta-chain", default-features = false }
+# floresta-chain without std (getfloresta/Floresta#1501, merged) and with its walks back along the
+# chain that no longer hash headers (not upstream yet): the `perf-chain-walks` branch of the fork
+floresta-chain = { git = "https://github.com/GPTechinno/Floresta", branch = "perf-chain-walks", default-features = false }
 rustreexo = { version = "=0.7.0", default-features = false }
 embedded-io-async = "0.7"
 tracing = { version = "0.1", default-features = false }

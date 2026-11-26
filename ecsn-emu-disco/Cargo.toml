@@ -11,9 +11,10 @@ publish = false
 [workspace]
 
 [dependencies]
-stm32h7-rax = { path = "../../emulator/stm32h7-rax" }
+# the STM32H7 on rax, from its repository
+stm32h7-rax = { git = "https://github.com/GPTechinno/stm32h7-rax", branch = "main" }
 # its network: a router with DHCP, DNS and NAT to the host
-esp32s3-rax = { path = "../../emulator/esp32s3-rax" }
+esp32s3-rax = { git = "https://github.com/GPTechinno/esp32s3-rax", branch = "main" }
 defmt-decoder = "1.2"
 goblin = "0.10"
 png = "0.18"

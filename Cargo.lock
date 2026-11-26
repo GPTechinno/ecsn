@@ -384,6 +384,7 @@ dependencies = [
 [[package]]
 name = "floresta-chain"
 version = "0.6.0"
+source = "git+https://github.com/GPTechinno/Floresta?branch=perf-chain-walks#6ea49332c2cba523c68c43e69f533a9bab01e5a7"
 dependencies = [
  "bitcoin",
  "bitcoin_hashes 1.1.0",
