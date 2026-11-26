@@ -67,3 +67,7 @@ opt-level = "s"
 # fork of rust-bitcoin, from its `0.32.xxx`
 bitcoin_hashes = { git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-sha256-extern" }
 bitcoin-io = { git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-sha256-extern" }
+# rustreexo 0.7.0 whose proofs are checked without copying their hashes nor reserving twice their
+# nodes, which a mainnet block's proof does not fit in the heap without: the `proof-memory` branch
+# of the fork, from its `v0.7.0`
+rustreexo = { git = "https://github.com/GPTechinno/rustreexo", branch = "proof-memory" }

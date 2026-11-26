@@ -29,6 +29,11 @@ branch of [GPTechinno/rust-bitcoin](https://github.com/GPTechinno/rust-bitcoin) 
 SHA-256 compression is then the firmware's `bitcoin_hashes_sha256_compress`, which the emulator
 runs on the host.
 
+The workspace and the firmware take `rustreexo` 0.7.0 from the `proof-memory` branch of
+[GPTechinno/rustreexo](https://github.com/GPTechinno/rustreexo) (a `[patch]`): it checks a proof
+without copying its hashes into a sorted list nor reserving room for twice as many computed nodes,
+which took about 21 MB for some mainnet blocks and does not fit in the board's heap.
+
 ## Environment
 
 devenv (stable Rust, the `thumbv7em-none-eabihf` target, the ARM C compiler for

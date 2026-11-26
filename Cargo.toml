@@ -24,3 +24,9 @@ embedded-io-async = "0.7"
 tracing = { version = "0.1", default-features = false }
 
 ecsn = { path = "ecsn" }
+
+[patch.crates-io]
+# rustreexo 0.7.0 whose proofs are checked without copying their hashes nor reserving twice their
+# nodes (about 21 MB for some mainnet blocks, 2 MB with it): the `proof-memory` branch of the fork,
+# from its `v0.7.0`
+rustreexo = { git = "https://github.com/GPTechinno/rustreexo", branch = "proof-memory" }

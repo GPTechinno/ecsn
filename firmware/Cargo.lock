@@ -1300,8 +1300,7 @@ dependencies = [
 [[package]]
 name = "rustreexo"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b936c4e0be58f59785a9bcd9c222f17e12f5303f3d7c44daffe10ccd432be034"
+source = "git+https://github.com/GPTechinno/rustreexo?branch=proof-memory#a0fefdc18c09b01b03d288688edd0a85d4dc96ab"
 dependencies = [
  "bitcoin-io 0.6.0",
  "bitcoin_hashes 1.1.0",
