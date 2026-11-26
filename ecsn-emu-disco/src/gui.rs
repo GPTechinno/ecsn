@@ -1,24 +1,30 @@
 //! The window (BLIT): the board, its front photographed, with what its
-//! display shows in the display's place (or the display alone at its size),
-//! under it its four user LEDs, its network address, the chain's validated
-//! tip, the emulation's pace and the RESET button; the firmware's logs beside
-//! them.
+//! display shows in the display's place and its four user LEDs shining where
+//! they are lit (or the display alone at its size); under it what the LEDs
+//! mean, its network address, the chain's validated tip, the emulation's pace
+//! and the RESET button; the firmware's logs beside them, scrolled both ways.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use blit::{Animation, AnimationOptions, Sides};
+use blit::{
+    Animation, AnimationOptions, Axis, Constraints, NodeTarget, Place, PlaceCx, Point, Rect, Sides,
+    Size,
+};
 use blit_desktop::{Application, Config, DesktopContext, EventLoopProxy, Scope, cpu};
 use blit_gui::clip::BoundsClip;
 use blit_gui::color::Color;
 use blit_gui::image::{Image, ImageData, ImageFormat, ImageHandle, ImagePixels, ImageSampling};
 use blit_gui::rectangle::Rectangle;
+use blit_gui::shadow::Shadow;
 use blit_gui::style::{Border, BorderRadius};
 use blit_gui::text::system::{FontStack, TextConfig, TextSystem};
 use blit_gui::text::{FontId, Text, TextStyle};
 use blit_gui_widgets::interact;
 use blit_gui_widgets::layout::{Align, Sizing, flex};
 use blit_gui_widgets::scroll::ScrollState;
+use blit_gui_widgets::scroll::area::ScrollArea;
 use blit_gui_widgets::scroll::uniform_list::UniformList;
 use blit_text::{Family, FontData};
 
@@ -41,10 +47,17 @@ const BOARD_WIDTH: f32 = SCREEN.0 as f32 + 2.0 * BEZEL;
 static PHOTO: &[u8] = include_bytes!("../assets/stm32h747i-disco.png");
 const PHOTO_SIZE: (f32, f32) = (1000.0, 743.0);
 const PHOTO_SCREEN: (f32, f32, f32) = (202.0, 83.0, 611.0);
+/// LD1 to LD4 in the photograph, top to bottom in the column left of the RESET
+/// button: the centre of each lens, and the lens's size.
+const PHOTO_LEDS: [(f32, f32); 4] = [(88.0, 553.6), (88.0, 566.2), (88.0, 580.1), (88.0, 593.6)];
+const PHOTO_LED: (f32, f32) = (13.0, 6.0);
 const SIDE_WIDTH: f32 = 560.0;
 const GAP: f32 = 18.0;
 const LOG_LINE: f32 = 16.0;
-const LED_SIZE: f32 = 30.0;
+/// The scrollbars' thickness.
+const BAR: f32 = 6.0;
+/// The legend's colour key.
+const KEY_SIZE: f32 = 10.0;
 
 const BACKGROUND: Color = Color::rgb(0x12, 0x14, 0x18);
 const PANEL: Color = Color::rgb(0x1c, 0x1f, 0x26);
@@ -55,14 +68,82 @@ const MUTED: Color = Color::rgb(0x9a, 0xa3, 0xb3);
 const ACCENT: Color = Color::rgb(0xf2, 0xc8, 0x1e);
 const HOVER: Color = Color::rgba(0xff, 0xff, 0xff, 0x28);
 const PRESSED: Color = Color::rgba(0xf2, 0xc8, 0x1e, 0x60);
-/// LD1 to LD4: green, orange, red, blue.
-const LEDS: [(&str, Color); 4] = [
-    ("LD1", Color::rgb(0x3d, 0xf5, 0x6b)),
-    ("LD2", Color::rgb(0xff, 0x9f, 0x1c)),
-    ("LD3", Color::rgb(0xff, 0x40, 0x40)),
-    ("LD4", Color::rgb(0x40, 0x8c, 0xff)),
+/// LD1 to LD4: their colour (green, orange, red, blue) and what the ECSN
+/// firmware shows with them.
+const LEDS: [(&str, [u8; 3], &str); 4] = [
+    ("LD1", [0x3d, 0xf5, 0x6b], "firmware running (blinks)"),
+    ("LD2", [0xff, 0x9f, 0x1c], "connected to the peer"),
+    ("LD3", [0xff, 0x40, 0x40], "not used"),
+    ("LD4", [0x40, 0x8c, 0xff], "not used"),
 ];
 const LED_OFF: Color = Color::rgb(0x2a, 0x2e, 0x2a);
+
+/// Places a node at `x`, `y` in its parent, out of the parent's flow, with a
+/// fixed size.
+struct At {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl<C: blit::Context<Scalar = f32>> Place<C> for At {
+    fn place(&self, cx: &mut PlaceCx<'_, C>, target: Rect<f32>) -> Point<f32> {
+        cx.resolve(Constraints::tight(Size::new(self.width, self.height)));
+        Point::new(target.x + self.x, target.y + self.y)
+    }
+}
+
+/// Places a node its parent's origin moved left by this much, at its own
+/// size: a log line scrolled sideways.
+struct Shift(f32);
+
+impl<C: blit::Context<Scalar = f32>> Place<C> for Shift {
+    fn place(&self, cx: &mut PlaceCx<'_, C>, target: Rect<f32>) -> Point<f32> {
+        cx.resolve(Constraints::loose(Size::new(f32::INFINITY, f32::INFINITY)));
+        Point::new(target.x - self.0, target.y)
+    }
+}
+
+/// The sideways part of a scroll: across, or down for a wheel that only turns
+/// (with Shift, or over the sideways bar).
+fn sideways_delta(delta: Point<f32>) -> f32 {
+    if delta.x != 0.0 { delta.x } else { delta.y }
+}
+
+/// A lit LED on the photograph, centred on `centre`: a wide soft halo of its
+/// colour, a tighter bright one, and the lens itself almost white.
+fn glow<L: blit::Layout<Ctx>>(
+    board: &mut blit::Ui<'_, Ctx, blit::state::Open<L>>,
+    centre: (f32, f32),
+    [r, g, b]: [u8; 3],
+) {
+    let (width, height) = PHOTO_LED;
+    let at = || At {
+        x: centre.0 - width / 2.0,
+        y: centre.1 - height / 2.0,
+        width,
+        height,
+    };
+    board.child().place(NodeTarget::Parent, at()).insert(
+        Shadow::new(Color::rgba(r, g, b, 0xb0))
+            .blur(16.0)
+            .spread(6.0)
+            .radius(BorderRadius::uniform(height)),
+    );
+    board.child().place(NodeTarget::Parent, at()).insert(
+        Shadow::new(Color::rgba(r, g, b, 0xe0))
+            .blur(5.0)
+            .spread(1.5)
+            .radius(BorderRadius::uniform(height / 2.0)),
+    );
+    let hot = |c: u8| c + ((255 - c) as f32 * 0.75) as u8;
+    board.child().place(NodeTarget::Parent, at()).insert(
+        Rectangle::new()
+            .background(Color::rgb(hot(r), hot(g), hot(b)))
+            .radius(BorderRadius::uniform(height / 2.0)),
+    );
+}
 
 /// Wakes the window after each snapshot.
 pub struct Wake;
@@ -80,6 +161,8 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 struct App {
     snapshot: Arc<Mutex<Snapshot>>,
     logs_scroll: ScrollState,
+    /// The logs' sideways scroll, the same for every line.
+    logs_sideways: ScrollState,
     seen_logs: u64,
     /// The display's picture, and the screen generation it shows.
     screen: Option<(u64, ImageHandle)>,
@@ -156,6 +239,7 @@ impl Application for App {
         Self {
             snapshot,
             logs_scroll: ScrollState::default(),
+            logs_sideways: ScrollState::default(),
             seen_logs: 0,
             screen: None,
             photo,
@@ -214,16 +298,25 @@ impl Application for App {
                     .layout(flex::column())
                     .pad(Sides::new().left(x).top(y));
                 board.insert(Image::new(photo).sampling(ImageSampling::Bilinear));
-                let mut glass = board.child().item(
-                    flex::item()
-                        .width(Sizing::fixed(w))
-                        .height(Sizing::fixed(h)),
-                );
-                match &self.screen {
-                    Some((_, image)) => {
-                        glass.insert(Image::new(image).sampling(ImageSampling::Bilinear))
+                {
+                    let mut glass = board.child().item(
+                        flex::item()
+                            .width(Sizing::fixed(w))
+                            .height(Sizing::fixed(h)),
+                    );
+                    match &self.screen {
+                        Some((_, image)) => {
+                            glass.insert(Image::new(image).sampling(ImageSampling::Bilinear))
+                        }
+                        None => glass.insert(Rectangle::new().background(Color::rgb(0, 0, 0))),
                     }
-                    None => glass.insert(Rectangle::new().background(Color::rgb(0, 0, 0))),
+                }
+                for ((_, rgb, _), (&centre, _)) in LEDS
+                    .iter()
+                    .zip(PHOTO_LEDS.iter().zip(snap.leds))
+                    .filter(|(_, (_, lit))| *lit)
+                {
+                    glow(&mut board, centre, *rgb);
                 }
             } else {
                 let mut bezel = left.child().layout(flex::column()).pad(BEZEL);
@@ -286,24 +379,32 @@ impl Application for App {
                 }
             }
             {
-                let mut leds = board.child().layout(flex::row().gap(22.0));
-                for (i, (label, lit)) in LEDS.iter().enumerate() {
-                    let mut led = leds
+                // What the LEDs mean, each with its colour; the photograph
+                // shows them lit, and without it the key does.
+                let mut legend = board.child().layout(flex::column().gap(5.0));
+                for ((label, [r, g, b], meaning), lit) in LEDS.iter().zip(snap.leds) {
+                    let mut row = legend
                         .child()
-                        .layout(flex::column().gap(4.0).align(Align::Center));
-                    led.child()
+                        .layout(flex::row().gap(8.0).align(Align::Center));
+                    let key = if on_board || lit {
+                        Color::rgb(*r, *g, *b)
+                    } else {
+                        LED_OFF
+                    };
+                    row.child()
                         .item(
                             flex::item()
-                                .width(Sizing::fixed(LED_SIZE))
-                                .height(Sizing::fixed(LED_SIZE)),
+                                .width(Sizing::fixed(KEY_SIZE))
+                                .height(Sizing::fixed(KEY_SIZE)),
                         )
                         .insert(
                             Rectangle::new()
-                                .background(if snap.leds[i] { *lit } else { LED_OFF })
-                                .border(Border::solid(1.0, Color::rgb(0x0a, 0x0a, 0x0a)))
-                                .radius(BorderRadius::uniform(LED_SIZE / 2.0)),
+                                .background(key)
+                                .radius(BorderRadius::uniform(KEY_SIZE / 2.0)),
                         );
-                    led.child().build(|ui: Ui<'_>| text(ui, label, 12.0, TEXT));
+                    row.child().build(|ui: Ui<'_>| text(ui, label, 12.0, TEXT));
+                    row.child()
+                        .build(|ui: Ui<'_>| text(ui, meaning, 12.0, MUTED));
                 }
             }
             let mut state = board.child().layout(flex::column().gap(8.0));
@@ -348,15 +449,30 @@ impl Application for App {
                 scroll.scroll_to(f32::MAX, Animation::default(), AnimationOptions::new());
             }
             self.seen_logs = snap.log_count;
+            // Sideways, every line moves by the same offset: the bar under
+            // the list (its thumb, its track, the wheel over it) moves it, and
+            // so does a sideways scroll, or the wheel with Shift, over a line.
+            let sideways = &mut self.logs_sideways;
+            let shift = sideways.offset.clamp(0.0, sideways.maximum_offset());
+            let overflow = sideways.content_extent > sideways.viewport_extent + 0.5;
+            let swiped = Cell::new(0.0f32);
             logs.child().item(flex::item().grow()).build(
                 UniformList::new(scroll, snap.logs.iter())
                     .item_extent(LOG_LINE)
                     .scroll_speed(2.0)
-                    .scrollbar_thickness(6.0)
+                    .scrollbar_thickness(BAR)
                     .minimum_thumb_extent(24.0)
                     .clip(BoundsClip)
                     .build_scrollbar(
-                        |mut ui: Ui<'_>, line: &String| {
+                        |ui: Ui<'_>, line: &String| {
+                            let mut ui = ui.layout(flex::row());
+                            let shifted = matches!(ui.input(), blit::Input::Scroll { modifiers, .. } if modifiers.shift());
+                            let swipe = if shifted {
+                                ui.interact(interact::scroll())
+                            } else {
+                                ui.interact(interact::scroll().axis(Axis::Horizontal))
+                            };
+                            swiped.set(swiped.get() + sideways_delta(swipe.delta));
                             let color = if line.contains("ERROR") {
                                 Color::rgb(0xff, 0x6b, 0x6b)
                             } else if line.contains("WARN") {
@@ -366,9 +482,8 @@ impl Application for App {
                             } else {
                                 TEXT
                             };
-                            let short: String = line.chars().take(300).collect();
-                            ui.insert(
-                                Text::new(&short)
+                            ui.child().place(NodeTarget::Parent, Shift(shift)).insert(
+                                Text::new(line)
                                     .style(TextStyle::new().font(MONO).size(12.0).color(color)),
                             );
                         },
@@ -388,6 +503,63 @@ impl Application for App {
                         },
                     ),
             );
+            // The bar's content is the longest line, invisible: its width is
+            // what there is to scroll.
+            let longest = snap
+                .logs
+                .iter()
+                .max_by_key(|line| line.chars().count())
+                .map_or("", String::as_str);
+            let sideways = &mut self.logs_sideways;
+            let mut bar = logs
+                .child()
+                .item(flex::item().height(Sizing::fixed(BAR + 2.0)))
+                .layout(flex::column());
+            let wheel = bar.interact(interact::scroll());
+            swiped.set(swiped.get() + sideways_delta(wheel.delta));
+            bar.child().build(
+                ScrollArea::new(sideways)
+                    .axis(Axis::Horizontal)
+                    .scroll_speed(2.0)
+                    .scrollbar_thickness(BAR)
+                    .minimum_thumb_extent(24.0)
+                    .build_scrollbar(
+                        |mut ui: Ui<'_>| {
+                            ui.insert(
+                                Text::new(longest).style(
+                                    TextStyle::new()
+                                        .font(MONO)
+                                        .size(12.0)
+                                        .color(Color::rgba(0, 0, 0, 0)),
+                                ),
+                            );
+                        },
+                        |mut ui: Ui<'_>| {
+                            if overflow {
+                                ui.insert(
+                                    Rectangle::new()
+                                        .background(Color::rgb(0x1a, 0x1c, 0x22))
+                                        .radius(BorderRadius::uniform(3.0)),
+                                );
+                            }
+                        },
+                        |mut ui: Ui<'_>, active: bool| {
+                            if overflow {
+                                ui.insert(
+                                    Rectangle::new()
+                                        .background(if active { ACCENT } else { MUTED })
+                                        .radius(BorderRadius::uniform(3.0)),
+                                );
+                            }
+                        },
+                    ),
+            );
+            drop(bar);
+            let swiped = swiped.get();
+            if swiped != 0.0 {
+                sideways.offset =
+                    (sideways.offset + 2.0 * swiped).clamp(0.0, sideways.maximum_offset());
+            }
         }
         if reset && let Some(session) = SESSION.lock().unwrap().as_ref() {
             session.send(Command::Reset);

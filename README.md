@@ -126,22 +126,29 @@ data among it) and takes up to a few minutes.
 ## The emulated board
 
 `ecsn-emu-disco` runs the firmware's ELF on the STM32H7 of `../emulator/stm32h7-rax` with the
-DISCO's 32 MB SDRAM, its two MT25QL512 (128 MB in dual-flash mode, kept in a file across runs with
-`--qspi`), its LAN8742A and a network behind it: esp32s3-rax's router, with DHCP, DNS and NAT, where
+DISCO's 32 MB SDRAM, its two MT25QL512 (128 MB in dual-flash mode, kept in a file across runs:
+`$XDG_DATA_HOME/ecsn-emu-disco/qspi.bin`, or `~/.local/share/ecsn-emu-disco/qspi.bin`, another file
+with `--qspi`, none with `--volatile`), its LAN8742A and a network behind it: esp32s3-rax's router, with DHCP, DNS and NAT, where
 the gateway 10.0.2.2 is the host's 127.0.0.1; and its display: the panel on the DSI link (an
 OTM8009A, `--panel nt35510` for the later controller) showing what the LTDC sends while the panel is
 awake and on and its backlight lit. The firmware is built with that peer:
 
 ```
 cd firmware && ECSN_PEER=10.0.2.2:18444 cargo build --release    # utreexod on the host, port 18444
-cd ../ecsn-emu-disco && cargo run --release -- --qspi /tmp/disco.img             # the window
-cargo run --release -- --headless --seconds 30 --realtime --qspi /tmp/disco.img  # logs on stdout
+cd ../ecsn-emu-disco && cargo run --release                          # the window
+cargo run --release -- --headless --seconds 30 --realtime --volatile  # logs on stdout, an erased flash
 ```
 
-The window shows the board, from the photograph of its front on ST's product page
-(`ecsn-emu-disco/assets`), with what the display shows in the display's place (DISPLAY 1:1 shows the
-display alone, at its size), under it the four LEDs, the address, the validated tip, the pace and a
-RESET button, beside the decoded defmt logs. Headless: `--screen-png FILE` saves what
+The flash image is read at the start (an erased flash if the file is missing) and written at the
+end, and at each RESET from the window, so a run resumes the chain store the last one left, as the
+board does after a reboot; the store is for the network the firmware was built for, so a firmware
+for another one takes another `--qspi` file. The window shows the board, from the photograph of its
+front on ST's product page (`ecsn-emu-disco/assets`), with what the display shows in the display's
+place and its four user LEDs (the column left of the RESET button, LD1 at the top) shining where
+they are lit (DISPLAY 1:1 shows the display alone, at its size); under it what the LEDs mean (LD1
+blinks while the firmware runs, LD2 is on while connected to the peer, LD3 and LD4 are not used),
+the address, the validated tip, the pace and a RESET button; beside them the decoded defmt logs,
+scrolled sideways by the bar under them, a sideways scroll or Shift and the wheel. Headless: `--screen-png FILE` saves what
 the display shows at the end, `--realtime` keeps virtual time no faster than the wall clock (for
 real peers; a board fallen behind, its core busy, does not catch up), `--profile SECONDS` samples
 the PC every millisecond and prints the busiest functions with their callers for each interval of
