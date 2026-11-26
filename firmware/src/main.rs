@@ -165,10 +165,17 @@ async fn show_step(screen: &mut Option<Screen>, step: &str, details: &[&str]) {
 
 /// SHA-256's block compression for `bitcoin_hashes` (its `sha256-extern` feature): its software
 /// one, behind a symbol of its own, which the emulator runs natively.
+///
+/// # Safety
+///
+/// `state` and `block` point to a state and a block that nothing else accesses during the call.
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn bitcoin_hashes_sha256_compress(state: *mut [u32; 8], block: *const [u8; 64]) {
-    // SAFETY: `bitcoin_hashes` passes the state and buffer of one of its engines.
+pub unsafe extern "C" fn bitcoin_hashes_sha256_compress(
+    state: *mut [u32; 8],
+    block: *const [u8; 64],
+) {
+    // SAFETY: the caller passes the state and buffer of one of its engines.
     unsafe { bitcoin_hashes::sha256::compress(&mut *state, &*block) }
 }
 
