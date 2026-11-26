@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use esp32s3_rax::machine::TICK_HZ;
 use esp32s3_rax::net::nat::{Router, RouterConfig};
 use stm32h7_rax::devices::ltdc::Frame;
+use stm32h7_rax::devices::rcc::RESET_IWDG1;
 use stm32h7_rax::{Config, Event, Stm32h7};
 
 use crate::logs::Logs;
@@ -41,6 +42,11 @@ pub struct Screen {
 
 pub struct Disco {
     pub machine: Stm32h7,
+    elf: Vec<u8>,
+    controller: Controller,
+    /// The virtual time, instructions and sleep of the chips before this one
+    /// (each reset starts a new chip).
+    before: (u64, u64, u64),
     logs: Logs,
     router: Router,
     pub leds: [bool; 4],
@@ -74,6 +80,29 @@ impl Disco {
             }
             _ => vec![0xFF; QSPI_BYTES],
         };
+        let (machine, panel) = Self::chip(elf, flash, controller)?;
+        Ok(Self {
+            machine,
+            elf: elf.to_vec(),
+            controller,
+            before: (0, 0, 0),
+            logs: Logs::new(elf)?,
+            router: Router::new(RouterConfig::default(), 0),
+            leds: [false; 4],
+            panel,
+            showing: false,
+            screen: Screen::default(),
+            qspi_path: qspi.map(Path::to_path_buf),
+        })
+    }
+
+    /// The chip running `elf` with the QSPI flash holding `flash`, and the
+    /// panel's state.
+    fn chip(
+        elf: &[u8],
+        flash: Vec<u8>,
+        controller: Controller,
+    ) -> Result<(Stm32h7, Arc<Mutex<PanelState>>), String> {
         let config = Config {
             hse_hz: HSE_HZ,
             uid: *b"ECSN-DISCO-1",
@@ -93,21 +122,55 @@ impl Disco {
                 p.dsi.device = Some(Box::new(panel));
             }
         }
-        Ok(Self {
-            machine,
-            logs: Logs::new(elf)?,
-            router: Router::new(RouterConfig::default(), 0),
-            leds: [false; 4],
-            panel: state,
-            showing: false,
-            screen: Screen::default(),
-            qspi_path: qspi.map(Path::to_path_buf),
-        })
+        Ok((machine, state))
+    }
+
+    /// Resets the chip as a reset with the RCC's reset `flags` does (see
+    /// `stm32h7_rax::devices::rcc`): the firmware starts again with the QSPI
+    /// flash as it is, the reset flags it had not cleared kept, the display
+    /// reset; the network around the board stays.
+    pub fn restart(&mut self, flags: u32) -> Result<(), String> {
+        let (flash, kept) = {
+            let p = self.machine.periph();
+            (p.quadspi.flash.bytes.clone(), p.rcc.reset_flags())
+        };
+        let (machine, panel) = Self::chip(&self.elf, flash, self.controller)?;
+        machine.periph().rcc.set_reset_flags(kept | flags);
+        let trace = self.machine.periph().trace;
+        machine.periph().trace = trace;
+        self.before = (self.now(), self.instructions(), self.asleep());
+        self.machine = machine;
+        self.panel = panel;
+        self.logs = Logs::new(&self.elf)?;
+        self.leds = [false; 4];
+        self.showing = false;
+        self.screen = Screen::default();
+        Ok(())
+    }
+
+    /// A watchdog reset, as [`Disco::restart`] does it.
+    pub fn watchdog_reset(&mut self) -> Result<(), String> {
+        self.restart(RESET_IWDG1)
+    }
+
+    /// The board's virtual time, picoseconds, across resets.
+    pub fn now(&self) -> u64 {
+        self.before.0 + self.machine.now()
+    }
+
+    /// Instructions run, across resets.
+    pub fn instructions(&self) -> u64 {
+        self.before.1 + self.machine.instructions
+    }
+
+    /// Virtual time the core slept, picoseconds, across resets.
+    pub fn asleep(&self) -> u64 {
+        self.before.2 + self.machine.asleep
     }
 
     /// The router's time: ticks of `TICK_HZ`.
     fn ticks(&self) -> u64 {
-        (u128::from(self.machine.now()) * u128::from(TICK_HZ) / u128::from(PS_PER_S)) as u64
+        (u128::from(self.now()) * u128::from(TICK_HZ) / u128::from(PS_PER_S)) as u64
     }
 
     /// Runs `duration` picoseconds of virtual time, then the board.

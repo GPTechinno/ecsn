@@ -47,13 +47,15 @@ struct Args {
     seconds: f64,
     /// The QSPI flash image, read at the start (an erased flash if missing)
     /// and written at the end, and at each RESET from the window, so the
-    /// firmware finds its chain store again at the next run [default:
-    /// $XDG_DATA_HOME/ecsn-emu-disco/qspi.bin, or
-    /// ~/.local/share/ecsn-emu-disco/qspi.bin]
+    /// firmware finds its chain store again at the next run [default: one per
+    /// network, the firmware's (read from its ELF): <network>.bin in
+    /// $XDG_DATA_HOME/ecsn-emu-disco or ~/.local/share/ecsn-emu-disco;
+    /// qspi.bin there for a firmware that does not say]
     #[arg(long)]
     qspi: Option<PathBuf>,
-    /// Start from an erased QSPI flash and save it nowhere
-    #[arg(long, conflicts_with = "qspi")]
+    /// Start from an erased QSPI flash and save it nowhere, whatever
+    /// `--qspi` says
+    #[arg(long)]
     volatile: bool,
     /// Keep virtual time no faster than the wall clock (for real peers)
     #[arg(long)]
@@ -85,24 +87,46 @@ fn parse_range(text: &str) -> Result<(u32, u32), String> {
     Ok((parse(start)?, parse(end)?))
 }
 
-/// Where the QSPI flash image is kept between runs, when `--qspi` names none.
-fn default_qspi() -> Option<PathBuf> {
+/// The network a firmware is built for, from the magic at its `ECSN_NETWORK_MAGIC` symbol; `None`
+/// for a firmware without it.
+fn firmware_network(elf: &[u8]) -> Option<&'static str> {
+    let image = goblin::elf::Elf::parse(elf).ok()?;
+    let symbol = image
+        .syms
+        .iter()
+        .find(|s| image.strtab.get_at(s.st_name) == Some("ECSN_NETWORK_MAGIC"))?;
+    let address = symbol.st_value;
+    let section = image.section_headers.iter().find(|h| {
+        h.sh_type != goblin::elf::section_header::SHT_NOBITS
+            && h.sh_addr <= address
+            && address + 4 <= h.sh_addr + h.sh_size
+    })?;
+    let offset = (section.sh_offset + address - section.sh_addr) as usize;
+    Some(match elf.get(offset..offset + 4)? {
+        [0xF9, 0xBE, 0xB4, 0xD9] => "mainnet",
+        [0x0B, 0x11, 0x09, 0x07] => "testnet",
+        [0x1C, 0x16, 0x3F, 0x28] => "testnet4",
+        [0x0A, 0x03, 0xCF, 0x40] => "signet",
+        [0xFA, 0xBF, 0xB5, 0xDA] => "regtest",
+        _ => return None,
+    })
+}
+
+/// Where the QSPI flash image is kept between runs, when `--qspi` names none: one per network, so
+/// that a firmware for one network does not format the store of another.
+fn default_qspi(network: Option<&str>) -> Option<PathBuf> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
         })?;
-    Some(data.join("ecsn-emu-disco").join("qspi.bin"))
+    let file = format!("{}.bin", network.unwrap_or("qspi"));
+    Some(data.join("ecsn-emu-disco").join(file))
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let qspi = if args.volatile {
-        None
-    } else {
-        args.qspi.clone().or_else(default_qspi)
-    };
     let elf = match std::fs::read(&args.elf) {
         Ok(elf) => elf,
         Err(e) => {
@@ -110,6 +134,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let network = firmware_network(&elf);
+    let qspi = if args.volatile {
+        None
+    } else {
+        args.qspi.clone().or_else(|| default_qspi(network))
+    };
+    println!(
+        "firmware for {}, flash image {}",
+        network.unwrap_or("an unknown network"),
+        qspi.as_ref()
+            .map_or("none (erased, saved nowhere)".into(), |p| p
+                .display()
+                .to_string())
+    );
     if !args.headless {
         gui::run(elf, qspi, args.panel);
         return ExitCode::SUCCESS;
@@ -124,7 +162,7 @@ fn main() -> ExitCode {
     disco.machine.periph().trace = args.mmio_trace;
     let total = (args.seconds * PS_PER_S as f64) as u64;
     let started = Instant::now();
-    let mut pace = Pace::new(disco.machine.now());
+    let mut pace = Pace::new(disco.now());
     // Ctrl-C or SIGTERM end the run as its end does: statistics, QSPI image.
     let interrupted = Arc::new(AtomicBool::new(false));
     let flag = interrupted.clone();
@@ -136,9 +174,9 @@ fn main() -> ExitCode {
     let mut next_report = every.unwrap_or(u64::MAX);
     let mut leds = disco.leds;
     let mut failed = false;
-    while disco.machine.now() < total && !interrupted.load(Ordering::Relaxed) {
+    while disco.now() < total && !interrupted.load(Ordering::Relaxed) {
         let out = disco.run(STEP);
-        let t = disco.machine.now() as f64 / PS_PER_S as f64;
+        let t = disco.now() as f64 / PS_PER_S as f64;
         for line in out.lines {
             println!("{t:10.6} {line}");
         }
@@ -148,20 +186,28 @@ fn main() -> ExitCode {
                 "{t:10.6} pc {:#010x} core {} Hz, {} instructions",
                 disco.machine.pc(),
                 hz,
-                disco.machine.instructions
+                disco.instructions()
             );
         }
         if disco.leds != leds {
             leds = disco.leds;
             println!("{t:10.6} LEDs LD1-LD4: {leds:?}");
         }
-        if let Some(event) = out.event {
+        if let Some(Event::WatchdogReset { pc }) = out.event {
+            println!("{t:10.6} emu: watchdog reset (pc {pc:#010x})");
+            if let Err(e) = disco.watchdog_reset() {
+                eprintln!("{e}");
+                failed = true;
+                break;
+            }
+        } else if let Some(event) = out.event {
             let regs = disco.machine.registers();
             match event {
                 Event::Breakpoint { pc, imm } => println!("{t:10.6} BKPT {imm:#x} at {pc:#010x}"),
                 Event::Fault { pc, message } => {
                     println!("{t:10.6} stopped at {pc:#010x}: {message}")
                 }
+                Event::WatchdogReset { .. } => {}
             }
             println!(
                 "registers: {}",
@@ -177,25 +223,25 @@ fn main() -> ExitCode {
         if let Some(profile) = &mut profile {
             let regs = disco.machine.registers();
             profile.sample(regs[15], regs[14]);
-            if disco.machine.now() >= next_report {
+            if disco.now() >= next_report {
                 next_report += every.unwrap_or(u64::MAX);
                 print!("{t:10.6} {}", profile.interval_report(12));
             }
         }
         if args.realtime {
-            std::thread::sleep(pace.ahead(disco.machine.now()));
+            std::thread::sleep(pace.ahead(disco.now()));
         }
     }
     if let Some(profile) = &profile {
         print!("{}", profile.whole_report(30));
     }
-    let virtual_s = disco.machine.now() as f64 / PS_PER_S as f64;
+    let virtual_s = disco.now() as f64 / PS_PER_S as f64;
     let wall = started.elapsed().as_secs_f64();
     println!(
         "{virtual_s:.3} s virtual in {wall:.3} s, {} instructions ({:.1} MIPS), asleep {:.1} %",
-        disco.machine.instructions,
-        disco.machine.instructions as f64 / wall / 1e6,
-        100.0 * disco.machine.asleep as f64 / disco.machine.now().max(1) as f64
+        disco.instructions(),
+        disco.instructions() as f64 / wall / 1e6,
+        100.0 * disco.asleep() as f64 / disco.now().max(1) as f64
     );
     println!(
         "Ethernet: {} frames dropped",

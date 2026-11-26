@@ -26,7 +26,10 @@ scrolled sideways by the bar under them, a sideways scroll, or Shift and the whe
   through host sockets; the gateway 10.0.2.2 is the host's 127.0.0.1.
 - The display on the DSI link: an OTM8009A, or an NT35510 (`--panel nt35510`), showing what the
   LTDC sends while the panel is awake and on and its backlight lit.
-- The four user LEDs, RESET, and defmt over RTT.
+- IWDG1, the watchdog: when it runs out the board restarts the chip, as RESET does, and the
+  firmware finds the watchdog's flag in the RCC's reset flags.
+- The four user LEDs, RESET (a restart of the chip with the flash as it is, which the emulator
+  also saves), and defmt over RTT.
 
 ## Running
 
@@ -42,8 +45,8 @@ cargo run --release -- --headless --seconds 30 --realtime --volatile  # logs on 
 | Option | |
 |---|---|
 | `--elf <ELF>` | the firmware, `../firmware/target/thumbv7em-none-eabihf/release/ecsn-firmware` by default |
-| `--qspi <FILE>` | the flash image, read at the start (an erased flash if missing) and written at the end and at each RESET; `$XDG_DATA_HOME/ecsn-emu-disco/qspi.bin`, or `~/.local/share/ecsn-emu-disco/qspi.bin`, by default. The chain store is for the network the firmware was built for: a firmware for another network takes another file |
-| `--volatile` | an erased flash, saved nowhere |
+| `--qspi <FILE>` | the flash image, read at the start (an erased flash if missing) and written at the end and at each RESET. By default one per network, the firmware's (it carries its network's magic at its `ECSN_NETWORK_MAGIC` symbol): `mainnet.bin`, `signet.bin`, `testnet.bin`, `testnet4.bin` or `regtest.bin` in `$XDG_DATA_HOME/ecsn-emu-disco` (or `~/.local/share/ecsn-emu-disco`), `qspi.bin` there for a firmware that does not say. The chain store records its network: a firmware given a file of another network formats it for its own (and says so), losing the chain it held |
+| `--volatile` | an erased flash, saved nowhere, whatever `--qspi` says |
 | `--panel <PANEL>` | `otm8009a` (the default), `nt35510`, or `none` |
 | `--headless` | no window: the logs, the emulator's notes and the network events on stdout, then the statistics |
 | `--seconds <S>` | the virtual time a headless run lasts, 10 s by default |

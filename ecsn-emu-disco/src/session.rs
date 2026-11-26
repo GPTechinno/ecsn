@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use stm32h7_rax::Event;
+use stm32h7_rax::devices::rcc::RESET_PIN;
 
 use crate::board::{Disco, Screen};
 use crate::pace::Pace;
@@ -130,17 +131,13 @@ fn run(
             return;
         }
     };
-    let mut pace = Pace::new(disco.machine.now());
+    let mut pace = Pace::new(disco.now());
     let mut last_frame = Instant::now();
     let mut last_screen = Instant::now();
     // the board's screen generation last taken, and the window's
     let mut seen_screen = u64::MAX;
     let mut shown = 0;
-    let mut window = (
-        Instant::now(),
-        disco.machine.now(),
-        disco.machine.instructions,
-    );
+    let mut window = (Instant::now(), disco.now(), disco.instructions());
     let mut pending: Vec<String> = Vec::new();
     let mut stopped = None;
     loop {
@@ -150,32 +147,32 @@ fn run(
                 if let Err(e) = disco.save_qspi() {
                     eprintln!("ecsn-emu-disco: QSPI image: {e}");
                 }
-                stopped = match Disco::new(&elf, qspi.as_deref(), controller) {
-                    Ok(new) => {
-                        disco = new;
-                        None
-                    }
-                    Err(e) => Some(e),
-                };
+                stopped = disco.restart(RESET_PIN).err();
                 pending.push("emu: reset".into());
                 seen_screen = u64::MAX;
-                pace = Pace::new(disco.machine.now());
-                window = (Instant::now(), 0, 0);
             }
             Err(TryRecvError::Empty) => {}
         }
         if stopped.is_none() {
             let out = disco.run(STEP);
-            let t = disco.machine.now() as f64 / PS_PER_S as f64;
+            let t = disco.now() as f64 / PS_PER_S as f64;
             pending.extend(out.lines.into_iter().map(|l| format!("{t:10.6} {l}")));
-            if let Some(event) = out.event {
-                stopped = Some(match event {
-                    Event::Breakpoint { pc, imm } => format!("BKPT {imm:#x} at {pc:#010x}"),
-                    Event::Fault { pc, message } => format!("stopped at {pc:#010x}: {message}"),
-                });
+            match out.event {
+                Some(Event::Breakpoint { pc, imm }) => {
+                    stopped = Some(format!("BKPT {imm:#x} at {pc:#010x}"))
+                }
+                Some(Event::Fault { pc, message }) => {
+                    stopped = Some(format!("stopped at {pc:#010x}: {message}"))
+                }
+                Some(Event::WatchdogReset { pc }) => {
+                    pending.push(format!("{t:10.6} emu: watchdog reset (pc {pc:#010x})"));
+                    stopped = disco.watchdog_reset().err();
+                    seen_screen = u64::MAX;
+                }
+                None => {}
             }
             // real time: the board's peers are real
-            std::thread::sleep(pace.ahead(disco.machine.now()).min(FRAME));
+            std::thread::sleep(pace.ahead(disco.now()).min(FRAME));
         } else {
             std::thread::sleep(FRAME);
         }
@@ -188,17 +185,13 @@ fn run(
             let (wall, virt, instructions) = window;
             let real = wall.elapsed().as_secs_f64();
             if real >= 1.0 {
-                s.speed = (disco.machine.now() - virt) as f64 / PS_PER_S as f64 / real;
-                s.mips = (disco.machine.instructions - instructions) as f64 / real / 1e6;
-                window = (
-                    Instant::now(),
-                    disco.machine.now(),
-                    disco.machine.instructions,
-                );
+                s.speed = (disco.now() - virt) as f64 / PS_PER_S as f64 / real;
+                s.mips = (disco.instructions() - instructions) as f64 / real / 1e6;
+                window = (Instant::now(), disco.now(), disco.instructions());
             }
             s.leds = disco.leds;
-            s.virtual_s = disco.machine.now() as f64 / PS_PER_S as f64;
-            s.asleep = disco.machine.asleep as f64 / disco.machine.now().max(1) as f64;
+            s.virtual_s = disco.now() as f64 / PS_PER_S as f64;
+            s.asleep = disco.asleep() as f64 / disco.now().max(1) as f64;
             s.stopped = stopped.clone();
             drop(s);
             if last_screen.elapsed() >= SCREEN_EVERY {
