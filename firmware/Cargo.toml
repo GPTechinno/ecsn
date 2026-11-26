@@ -24,13 +24,13 @@ embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "execu
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
 embassy-futures = "0.1"
-# the display's user interface: BLIT built without std (its widgets without std are not upstream):
-# the `local/no-std` branch of the fork
-blit = { git = "https://github.com/Georges760/blit", branch = "local/no-std" }
-blit-gui = { git = "https://github.com/Georges760/blit", branch = "local/no-std" }
-blit-cpu = { git = "https://github.com/Georges760/blit", branch = "local/no-std", default-features = false }
-blit-text = { git = "https://github.com/Georges760/blit", branch = "local/no-std" }
-blit-widget = { git = "https://github.com/Georges760/blit", branch = "local/no-std", default-features = false }
+# the display's user interface: BLIT built without std, from upstream (not on crates.io: `blit`
+# there is another crate)
+blit = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83" }
+blit-gui = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83" }
+blit-cpu = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83", default-features = false }
+blit-text = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83" }
+blit-widget = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83", default-features = false }
 embedded-io-async = "0.7"
 stm32-fmc = "0.4.0"
 embedded-alloc = { version = "0.7.0", default-features = false, features = ["tlsf"] }

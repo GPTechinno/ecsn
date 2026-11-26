@@ -104,9 +104,9 @@ Optional build-time settings:
   `version` messages; until then the display shows the peer's time and `version` carries the
   build's.
 
-The display is drawn with BLIT, taken by git from the `local/no-std` branch of the fork
-[Georges760/blit](https://github.com/Georges760/blit): https://github.com/nicoburniske/blit with
-`blit-widget` built without `std`. Its glyphs are rendered at build time from the DejaVu fonts in the directory `ECSN_FONTS`,
+The display is drawn with BLIT, taken by git from upstream,
+[nicoburniske/blit](https://github.com/nicoburniske/blit), pinned at a revision, built without
+`std`. Its glyphs are rendered at build time from the DejaVu fonts in the directory `ECSN_FONTS`,
 which the devenv sets.
 
 The peer must accept the board's connection: run utreexod with `--listen` on a LAN address, not
