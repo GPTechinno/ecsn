@@ -17,6 +17,12 @@
 //! until it first answers). Until it answers, the display shows the peer's time, from its
 //! `version` message, and the node's own `version` message carries the build's time.
 //!
+//! At the start the firmware logs what reset the chip (the RCC's reset flags). The independent
+//! watchdog (IWDG1, 32 s) is armed once the node reaches the block sync, past the one-off steps
+//! that hold the core longer (marking the chain as assumed); from then on a core held 32 s resets
+//! the board, which resumes from the flash. The executor's stalls and the heap's peak are logged
+//! as they grow.
+//!
 //! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to the peer.
 //! The display shows the step the firmware is at while it starts, then the node's state, redrawn
 //! every second.
@@ -48,13 +54,13 @@ use bitcoin::Network;
 use core::net::Ipv4Addr;
 use defmt::{error, info, unwrap, warn, Debug2Format};
 use display::Display;
-use ecsn::node::{Config, Node};
+use ecsn::node::{Config, Node, Phase};
 use ecsn::p2p::Connection;
 use ecsn::store::{FlashChainStore, MemChainStore};
 use embassy_executor::Spawner;
 
 use ecsn::sntp;
-use embassy_futures::join::join3;
+use embassy_futures::join::join4;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -62,8 +68,9 @@ use embassy_net::{IpAddress, Stack, StackResources};
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::fmc::Fmc;
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::peripherals::{ETH, ETH_SMA};
+use embassy_stm32::peripherals::{ETH, ETH_SMA, IWDG1};
 use embassy_stm32::rng::{self, Rng};
+use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{bind_interrupts, eth, peripherals, SharedData};
 use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use embedded_alloc::TlsfHeap;
@@ -104,8 +111,33 @@ const NTP_SERVER: &str = match option_env!("ECSN_NTP") {
 /// How often the time is asked for once known, and until then.
 const NTP_INTERVAL: Duration = Duration::from_secs(300);
 const NTP_RETRY: Duration = Duration::from_secs(30);
+/// The watchdog's timeout, the longest IWDG1 allows (32.768 s).
+const WATCHDOG_TIMEOUT_US: u32 = 32_000_000;
+/// How often the guard looks at the executor, the heap and the node, and pets the watchdog.
+const GUARD_PERIOD: Duration = Duration::from_secs(1);
 
 type Device = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
+
+/// What reset the chip, from the RCC's reset flags, which it then clears for the next start.
+fn reset_cause() -> &'static str {
+    let rcc = embassy_stm32::pac::RCC;
+    let flags = rcc.rsr().read();
+    let cause = if flags.iwdg1rstf() {
+        "the watchdog"
+    } else if flags.sftrstf() {
+        "software"
+    } else if flags.porrstf() {
+        "power-on"
+    } else if flags.borrstf() {
+        "brown-out"
+    } else if flags.pinrstf() {
+        "the reset pin"
+    } else {
+        "unknown"
+    };
+    rcc.rsr().modify(|w| w.set_rmvf(true));
+    cause
+}
 
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, Device>) -> ! {
@@ -131,15 +163,31 @@ async fn show_step(screen: &mut Option<Screen>, step: &str, details: &[&str]) {
     }
 }
 
-fn network() -> Network {
-    match NETWORK.unwrap_or("regtest") {
-        "bitcoin" => Network::Bitcoin,
-        "testnet" => Network::Testnet,
-        "testnet4" => Network::Testnet4,
-        "signet" => Network::Signet,
-        "regtest" => Network::Regtest,
-        other => defmt::panic!("ECSN_NETWORK: unknown network {=str}", other),
+/// The magic of the network named `name`, at build time: an unknown name fails the build.
+const fn network_magic(name: &str) -> [u8; 4] {
+    match name.as_bytes() {
+        b"bitcoin" => [0xF9, 0xBE, 0xB4, 0xD9],
+        b"testnet" => [0x0B, 0x11, 0x09, 0x07],
+        b"testnet4" => [0x1C, 0x16, 0x3F, 0x28],
+        b"signet" => [0x0A, 0x03, 0xCF, 0x40],
+        b"regtest" => [0xFA, 0xBF, 0xB5, 0xDA],
+        _ => panic!("ECSN_NETWORK: bitcoin, testnet, testnet4, signet or regtest"),
     }
+}
+
+/// The magic of the network the firmware is built for, at a symbol of its own: the emulator reads
+/// it from the ELF to pick the flash image of that network.
+#[unsafe(no_mangle)]
+#[used]
+static ECSN_NETWORK_MAGIC: [u8; 4] = network_magic(match NETWORK {
+    Some(name) => name,
+    None => "regtest",
+});
+
+fn network() -> Network {
+    // read through the symbol, which keeps it in the image
+    let magic = unsafe { core::ptr::read_volatile(&ECSN_NETWORK_MAGIC) };
+    unwrap!(Network::from_magic(bitcoin::p2p::Magic::from_bytes(magic)))
 }
 
 #[embassy_executor::main]
@@ -179,7 +227,15 @@ async fn main(spawner: Spawner) {
         config.rcc.voltage_scale = VoltageScale::Scale1;
     }
     let p = embassy_stm32::init_primary(config, &SHARED_DATA);
+    let cause = reset_cause();
     info!("ECSN {=str}", env!("CARGO_PKG_VERSION"));
+    if cause == "the watchdog" {
+        warn!("reset by {=str}", cause);
+    } else {
+        info!("reset by {=str}", cause);
+    }
+    // configured now, armed by the guard (see `follow`)
+    let watchdog = IndependentWatchdog::new(p.IWDG1, WATCHDOG_TIMEOUT_US);
 
     let mut core = unwrap!(cortex_m::Peripherals::take());
     core.SCB.enable_icache();
@@ -354,6 +410,7 @@ async fn main(spawner: Spawner) {
         nonce,
         ntp_cookie,
         connected,
+        watchdog,
     };
     if RAM_STORE {
         info!("chain store: RAM");
@@ -367,12 +424,28 @@ async fn main(spawner: Spawner) {
         Err(e) => defmt::panic!("QSPI flash: {}", e),
     };
     info!("QSPI flash: mounting the chain store (formatting a flash without one takes minutes)");
-    show_step(
-        &mut screen,
-        "Mounting the chain store",
-        &["a flash without one is formatted first:", "a few minutes"],
-    )
-    .await;
+    // a store of another network is formatted for this one: say so first
+    let other = match FlashChainStore::stored_network(&flash) {
+        Ok(Some(stored)) if stored != network => Some(stored),
+        _ => None,
+    };
+    let other_line;
+    let details: [&str; 2] = match other {
+        Some(stored) => {
+            warn!(
+                "QSPI flash: it holds a chain of {}, formatted now for {}",
+                defmt::Display2Format(&stored),
+                defmt::Display2Format(&network)
+            );
+            other_line = format!("the flash holds a chain of {stored}:");
+            [
+                other_line.as_str(),
+                "formatted for this network, a few minutes",
+            ]
+        }
+        None => ["a flash without one is formatted first:", "a few minutes"],
+    };
+    show_step(&mut screen, "Mounting the chain store", &details).await;
     let store = match FlashChainStore::mount(flash, network, true) {
         Ok((store, formatted)) => {
             info!(
@@ -390,7 +463,7 @@ async fn main(spawner: Spawner) {
 }
 
 /// The network side of the node: the stack, the peer, what the `version` message needs, the
-/// first SNTP cookie, and LD2.
+/// first SNTP cookie, LD2, and the watchdog the guard arms.
 struct Link {
     stack: Stack<'static>,
     peer: SocketAddrV4,
@@ -398,6 +471,7 @@ struct Link {
     nonce: u64,
     ntp_cookie: u64,
     connected: Output<'static>,
+    watchdog: IndependentWatchdog<'static, IWDG1>,
 }
 
 /// The time of day, from SNTP: Unix milliseconds at an instant of the board's clock.
@@ -510,6 +584,7 @@ async fn follow<S: ChainStore>(
         nonce,
         ntp_cookie,
         mut connected,
+        mut watchdog,
     } = link;
     let build_time: i64 = BUILD_TIME.parse().unwrap_or(0);
     let wall = WallClock::new();
@@ -583,6 +658,44 @@ async fn follow<S: ChainStore>(
             Timer::after(wait).await;
         }
     };
+    // The guard: how long the executor was held between two of its looks, the heap's peak, and
+    // the watchdog, armed once the node reaches the block sync.
+    let guard = async {
+        let mut armed = false;
+        let mut longest = Duration::from_ticks(0);
+        let mut heap_peak = 0;
+        let mut last = Instant::now();
+        loop {
+            Timer::after(GUARD_PERIOD).await;
+            let now = Instant::now();
+            let stall = (now - last)
+                .checked_sub(GUARD_PERIOD)
+                .unwrap_or(Duration::from_ticks(0));
+            last = now;
+            let phase = node.status().phase;
+            if stall > longest && stall >= Duration::from_secs(1) {
+                longest = stall;
+                warn!(
+                    "the executor was held {=u64} ms, the longest so far ({})",
+                    stall.as_millis(),
+                    Debug2Format(&phase)
+                );
+            }
+            if !armed && matches!(phase, Phase::Blocks | Phase::Following) {
+                watchdog.unleash();
+                armed = true;
+                info!("watchdog armed: {=u32} s", WATCHDOG_TIMEOUT_US / 1_000_000);
+            }
+            if armed {
+                watchdog.pet();
+            }
+            let used = sdram::SIZE - HEAP.free();
+            if used >= heap_peak + (1 << 20) {
+                heap_peak = used;
+                info!("heap: {=usize} KB used, the most so far", used >> 10);
+            }
+        }
+    };
     let dashboard = async {
         let Some(mut screen) = screen else {
             return core::future::pending::<()>().await;
@@ -635,6 +748,6 @@ async fn follow<S: ChainStore>(
             Timer::after_secs(1).await;
         }
     };
-    join3(connection, time, dashboard).await;
+    join4(connection, time, guard, dashboard).await;
     defmt::unreachable!()
 }

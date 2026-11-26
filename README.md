@@ -113,6 +113,11 @@ The peer must accept the board's connection: run utreexod with `--listen` on a L
 `127.0.0.1`. LD1 (green) blinks while the firmware runs. LD2 (orange) is on while it is
 connected.
 
+The firmware logs at its start what reset the chip (power-on, the reset pin, the watchdog,
+software). Its watchdog (IWDG1, 32 s) is armed once the node reaches the block sync, past the
+one-off steps that hold the core longer; from then on a core held 32 s resets the board, which
+resumes from the flash. The executor's stalls and the heap's peak are logged as they grow.
+
 The 4" display (800 × 480, MIPI DSI) shows, drawn with BLIT, the step the firmware is at while it
 starts (DHCP, the chain store), then the node, redrawn every second: the validated height out of the best header with
 its progress, the validated tip (hash, time, age, transactions, inputs proven, size), the node's
