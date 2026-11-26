@@ -99,6 +99,10 @@ Optional build-time settings:
 - `ECSN_ASSUME_UTREEXO`: set it to start from `floresta-chain`'s accumulator.
 - `ECSN_RAM_STORE`: set it to keep the chain in RAM instead of on the QSPI flash.
 - `ECSN_LOG`: the log level, `info` by default.
+- `ECSN_NTP`: the SNTP server, a name or an IPv4 address, `pool.ntp.org` by default. The node asks
+  it the time at the start and every 5 minutes (every 30 s until it answers) for its clock and its
+  `version` messages; until then the display shows the peer's time and `version` carries the
+  build's.
 
 The display is drawn with BLIT, taken by git from the `local/no-std` branch of the fork
 [Georges760/blit](https://github.com/Georges760/blit): https://github.com/nicoburniske/blit with

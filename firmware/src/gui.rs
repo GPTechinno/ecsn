@@ -237,7 +237,7 @@ fn header(root: &mut Flex<'_>, network: &str, clock: Option<i64>, uptime: u64) {
     let mut right = header
         .child()
         .layout(flex::column().gap(2.0).align(Align::End));
-    // the clock is the peer's: none before the first handshake
+    // SNTP's clock, or the peer's until SNTP answers: none before either
     if let Some(unix) = clock {
         let now = format!("{} UTC", date_time(unix));
         right.child().build(|ui: Ui<'_>| bold(ui, &now, 15.0, TEXT));

@@ -6,6 +6,7 @@
 //! - [`store`]: [`ChainStore`](floresta_chain::ChainStore)s in RAM, and on NOR [`flash`].
 //! - [`node`]: the handshake, the header sync and the validation of each block with its
 //!   Utreexo proof.
+//! - [`sntp`]: the time of day from an SNTP server, for a board with no clock.
 
 #![no_std]
 
@@ -14,4 +15,5 @@ extern crate alloc;
 pub mod flash;
 pub mod node;
 pub mod p2p;
+pub mod sntp;
 pub mod store;

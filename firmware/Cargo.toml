@@ -22,7 +22,7 @@ tracing = { version = "0.1", default-features = false }
 embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h747xi-cm7", "time-driver-any", "exti", "unstable-pac"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet"] }
+embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
 embassy-futures = "0.1"
 # the display's user interface: BLIT built without std (its widgets without std are not upstream):
 # the `local/no-std` branch of the fork

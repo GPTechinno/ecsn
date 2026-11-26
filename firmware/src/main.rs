@@ -10,7 +10,12 @@
 //! - `ECSN_RAM_STORE`: set to keep the chain in RAM instead, lost on reset;
 //! - `ECSN_BLOCKS_IN_FLIGHT`: blocks asked for at once while syncing, 4 by default (each is held
 //!   in RAM until validated, up to a few megabytes on mainnet);
-//! - `ECSN_LOG`: the most detailed log level of the node (`info` by default).
+//! - `ECSN_LOG`: the most detailed log level of the node (`info` by default);
+//! - `ECSN_NTP`: the SNTP server, a name or an IPv4 address, `pool.ntp.org` by default.
+//!
+//! The time of day comes from the SNTP server, asked at the start and every 5 minutes (every 30 s
+//! until it first answers). Until it answers, the display shows the peer's time, from its
+//! `version` message, and the node's own `version` message carries the build's time.
 //!
 //! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to the peer.
 //! The display shows the step the firmware is at while it starts, then the node's state, redrawn
@@ -40,22 +45,27 @@ use core::net::SocketAddrV4;
 use core::str::FromStr;
 
 use bitcoin::Network;
+use core::net::Ipv4Addr;
 use defmt::{error, info, unwrap, warn, Debug2Format};
 use display::Display;
 use ecsn::node::{Config, Node};
 use ecsn::p2p::Connection;
 use ecsn::store::{FlashChainStore, MemChainStore};
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+
+use ecsn::sntp;
+use embassy_futures::join::join3;
+use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Stack, StackResources};
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{IpAddress, Stack, StackResources};
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::fmc::Fmc;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::peripherals::{ETH, ETH_SMA};
 use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::{bind_interrupts, eth, peripherals, SharedData};
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use embedded_alloc::TlsfHeap;
 use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
 use screen::Screen;
@@ -83,8 +93,17 @@ const NETWORK: Option<&str> = option_env!("ECSN_NETWORK");
 const ASSUME_UTREEXO: bool = option_env!("ECSN_ASSUME_UTREEXO").is_some();
 const RAM_STORE: bool = option_env!("ECSN_RAM_STORE").is_some();
 const BLOCKS_IN_FLIGHT: Option<&str> = option_env!("ECSN_BLOCKS_IN_FLIGHT");
-/// The board has no clock set: the build's time, close enough for the peer's time offset.
+/// The time the `version` message carries until SNTP answers: the build's, close enough for the
+/// peer's time offset.
 const BUILD_TIME: &str = env!("ECSN_BUILD_TIME");
+/// The SNTP server.
+const NTP_SERVER: &str = match option_env!("ECSN_NTP") {
+    Some(server) => server,
+    None => "pool.ntp.org",
+};
+/// How often the time is asked for once known, and until then.
+const NTP_INTERVAL: Duration = Duration::from_secs(300);
+const NTP_RETRY: Duration = Duration::from_secs(30);
 
 type Device = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 
@@ -269,6 +288,7 @@ async fn main(spawner: Spawner) {
     let mut rng = Rng::new(p.RNG, Irqs);
     let seed = rng.next_u64();
     let nonce = rng.next_u64();
+    let ntp_cookie = rng.next_u64();
 
     // a locally administered address from the chip's unique ID
     let uid = embassy_stm32::uid::uid();
@@ -290,7 +310,8 @@ async fn main(spawner: Spawner) {
         p.PA2, // MDIO
         p.PC1, // MDC
     );
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    // DHCP, DNS, the peer's TCP socket and SNTP's UDP socket, and two spare
+    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         device,
         embassy_net::Config::dhcpv4(Default::default()),
@@ -326,13 +347,12 @@ async fn main(spawner: Spawner) {
             Some(Err(_)) => defmt::panic!("ECSN_BLOCKS_IN_FLIGHT: not a number"),
         },
     };
-    let now: i64 = BUILD_TIME.parse().unwrap_or(0);
     let link = Link {
         stack,
         peer,
         mac,
         nonce,
-        now,
+        ntp_cookie,
         connected,
     };
     if RAM_STORE {
@@ -369,16 +389,108 @@ async fn main(spawner: Spawner) {
     follow(store, Some(capacity), config, link, screen).await
 }
 
-/// The network side of the node: the stack, the peer, what the `version` message needs, and
-/// LD2.
+/// The network side of the node: the stack, the peer, what the `version` message needs, the
+/// first SNTP cookie, and LD2.
 struct Link {
     stack: Stack<'static>,
     peer: SocketAddrV4,
     mac: [u8; 6],
     nonce: u64,
-    /// Unix time, seconds.
-    now: i64,
+    ntp_cookie: u64,
     connected: Output<'static>,
+}
+
+/// The time of day, from SNTP: Unix milliseconds at an instant of the board's clock.
+struct WallClock(Cell<Option<(i64, Instant)>>);
+
+impl WallClock {
+    const fn new() -> Self {
+        Self(Cell::new(None))
+    }
+
+    fn set(&self, unix_ms: i64, at: Instant) {
+        self.0.set(Some((unix_ms, at)));
+    }
+
+    /// Unix milliseconds now, once SNTP has answered.
+    fn now_ms(&self) -> Option<i64> {
+        self.0
+            .get()
+            .map(|(unix_ms, at)| unix_ms + at.elapsed().as_millis() as i64)
+    }
+
+    /// Unix seconds now, once SNTP has answered.
+    fn now(&self) -> Option<i64> {
+        self.now_ms().map(|ms| ms.div_euclid(1000))
+    }
+}
+
+/// Why the SNTP server gave no time.
+enum NtpError {
+    /// Its name did not resolve to an IPv4 address.
+    Resolve,
+    Socket,
+    /// No reply within 5 s.
+    Timeout,
+    Reply(sntp::Error),
+}
+
+impl defmt::Format for NtpError {
+    fn format(&self, f: defmt::Formatter) {
+        match self {
+            NtpError::Resolve => defmt::write!(f, "no IPv4 address for the name"),
+            NtpError::Socket => defmt::write!(f, "UDP socket error"),
+            NtpError::Timeout => defmt::write!(f, "no reply in 5 s"),
+            NtpError::Reply(e) => defmt::write!(f, "{}", defmt::Display2Format(e)),
+        }
+    }
+}
+
+/// Asks [`NTP_SERVER`] for the time with `cookie`: Unix milliseconds at the returned instant.
+async fn ask_time(stack: Stack<'static>, cookie: u64) -> Result<(i64, Instant), NtpError> {
+    let server = match Ipv4Addr::from_str(NTP_SERVER) {
+        Ok(address) => address,
+        Err(_) => {
+            let addresses = stack
+                .dns_query(NTP_SERVER, DnsQueryType::A)
+                .await
+                .map_err(|_| NtpError::Resolve)?;
+            match addresses.first() {
+                Some(IpAddress::Ipv4(address)) => *address,
+                None => return Err(NtpError::Resolve),
+            }
+        }
+    };
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx = [0; 2 * sntp::PACKET];
+    let mut tx = [0; sntp::PACKET];
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx, &mut tx_meta, &mut tx);
+    socket.bind(0).map_err(|_| NtpError::Socket)?;
+    let sent = Instant::now();
+    socket
+        .send_to(&sntp::request(cookie), (server, sntp::PORT))
+        .await
+        .map_err(|_| NtpError::Socket)?;
+    let mut packet = [0; sntp::PACKET];
+    loop {
+        let remaining = Duration::from_secs(5).checked_sub(sent.elapsed());
+        let received = with_timeout(
+            remaining.unwrap_or(Duration::MIN),
+            socket.recv_from(&mut packet),
+        )
+        .await;
+        let (n, _) = received
+            .map_err(|_| NtpError::Timeout)?
+            .map_err(|_| NtpError::Socket)?;
+        let arrived = Instant::now();
+        match sntp::reply(&packet[..n], cookie) {
+            Ok(reply) => return Ok((reply.arrival((arrived - sent).as_millis()), arrived)),
+            // a late reply to an earlier request
+            Err(sntp::Error::NotOurs) => continue,
+            Err(e) => return Err(NtpError::Reply(e)),
+        }
+    }
 }
 
 /// Runs the node on `store` against the peer, reconnecting when the connection ends, and shows
@@ -396,9 +508,11 @@ async fn follow<S: ChainStore>(
         peer,
         mac,
         nonce,
-        now,
+        ntp_cookie,
         mut connected,
     } = link;
+    let build_time: i64 = BUILD_TIME.parse().unwrap_or(0);
+    let wall = WallClock::new();
     let node = match Node::new(store, config, nonce) {
         Ok(node) => node,
         Err(e) => defmt::panic!("chain: {}", Debug2Format(&e)),
@@ -423,6 +537,7 @@ async fn follow<S: ChainStore>(
                 connected.set_low();
                 state.set(gui::Link::Connected);
                 let mut conn = Connection::new(socket, network);
+                let now = wall.now().unwrap_or(build_time);
                 if let Err(e) = node.run(&mut conn, now).await {
                     error!("peer {}: {}", Debug2Format(&peer), Debug2Format(&e));
                 }
@@ -440,21 +555,49 @@ async fn follow<S: ChainStore>(
             Timer::after_secs(5).await;
         }
     };
+    let time = async {
+        let mut cookie = ntp_cookie;
+        loop {
+            cookie = cookie.wrapping_add(1);
+            let wait = match ask_time(stack, cookie).await {
+                Ok((unix_ms, at)) => {
+                    let ours = wall.now_ms();
+                    wall.set(unix_ms, at);
+                    let text = gui::date_time(unix_ms.div_euclid(1000));
+                    match ours {
+                        None => info!("clock: {=str} UTC from {=str}", text.as_str(), NTP_SERVER),
+                        Some(ours) => info!(
+                            "clock: {=str} UTC from {=str}, ours was {=i64} ms off",
+                            text.as_str(),
+                            NTP_SERVER,
+                            ours - (unix_ms + at.elapsed().as_millis() as i64)
+                        ),
+                    }
+                    NTP_INTERVAL
+                }
+                Err(e) => {
+                    warn!("clock: {=str}: {}", NTP_SERVER, e);
+                    NTP_RETRY
+                }
+            };
+            Timer::after(wait).await;
+        }
+    };
     let dashboard = async {
         let Some(mut screen) = screen else {
             return core::future::pending::<()>().await;
         };
         let peer_text = format!("{peer}");
         let network_name = NETWORK.unwrap_or("regtest");
-        // the peer's clock at its handshake, and ours then
-        let mut clock: Option<(i64, Instant)> = None;
+        // the peer's clock at its handshake, and ours then, until SNTP answers
+        let mut peer_clock: Option<(i64, Instant)> = None;
         let mut connections = 0;
         loop {
             let status = node.status();
             if status.connections != connections {
                 connections = status.connections;
                 if let Some(peer) = &status.peer {
-                    clock = Some((peer.time, Instant::now()));
+                    peer_clock = Some((peer.time, Instant::now()));
                 }
             }
             let chain = node.chain();
@@ -467,7 +610,9 @@ async fn follow<S: ChainStore>(
             let acc = chain.acc();
             let view = gui::Dashboard {
                 network: network_name,
-                clock: clock.map(|(time, at)| time + at.elapsed().as_secs() as i64),
+                clock: wall
+                    .now()
+                    .or_else(|| peer_clock.map(|(time, at)| time + at.elapsed().as_secs() as i64)),
                 uptime: Instant::now().as_secs(),
                 address: stack.config_v4().map(|v4| format!("{}", v4.address)),
                 mac,
@@ -490,6 +635,6 @@ async fn follow<S: ChainStore>(
             Timer::after_secs(1).await;
         }
     };
-    join(connection, dashboard).await;
+    join3(connection, time, dashboard).await;
     defmt::unreachable!()
 }
