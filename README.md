@@ -131,6 +131,8 @@ data among it) and takes up to a few minutes.
 
 ## The emulated board
 
+[`ecsn-emu-disco/README.md`](ecsn-emu-disco/README.md) has a screenshot and every option.
+
 `ecsn-emu-disco` runs the firmware's ELF on the STM32H7 of [stm32h7-rax](https://github.com/GPTechinno/stm32h7-rax) with the
 DISCO's 32 MB SDRAM, its two MT25QL512 (128 MB in dual-flash mode, kept in a file across runs:
 `$XDG_DATA_HOME/ecsn-emu-disco/qspi.bin`, or `~/.local/share/ecsn-emu-disco/qspi.bin`, another file
