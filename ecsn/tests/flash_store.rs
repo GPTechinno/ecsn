@@ -109,6 +109,29 @@ fn a_blank_flash_is_formatted_only_when_asked() {
 }
 
 #[test]
+fn a_store_of_another_network_is_formatted_for_this_one_when_asked() {
+    let bytes = formatted(CAPACITY).into_flash().bytes().to_vec();
+    let flash = RamFlash::from_bytes(bytes.clone());
+    assert_eq!(
+        FlashChainStore::stored_network(&flash).unwrap(),
+        Some(Network::Regtest)
+    );
+    assert_eq!(
+        FlashChainStore::stored_network(&RamFlash::new(CAPACITY)).unwrap(),
+        None
+    );
+    let (store, formatted) =
+        FlashChainStore::mount(RamFlash::from_bytes(bytes), Network::Signet, true).unwrap();
+    assert!(formatted);
+    let bytes = store.into_flash().bytes().to_vec();
+    let (_, formatted) =
+        FlashChainStore::mount(RamFlash::from_bytes(bytes.clone()), Network::Signet, false)
+            .unwrap();
+    assert!(!formatted);
+    assert!(FlashChainStore::mount(RamFlash::from_bytes(bytes), Network::Regtest, false).is_err());
+}
+
+#[test]
 fn formatting_erases_what_the_flash_held() {
     let fixture = fixture();
     let flash = Shared::new(CAPACITY);

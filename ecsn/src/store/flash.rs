@@ -285,6 +285,15 @@ pub struct FlashChainStore<F: Flash> {
 }
 
 impl<F: Flash> FlashChainStore<F> {
+    /// The network of the store `flash` holds, if it holds one of this format (whatever its
+    /// size): a firmware for another network formats it when it mounts it.
+    pub fn stored_network(flash: &F) -> Result<Option<Network>, ChainstoreError> {
+        let mut sb = [0; SUPERBLOCK_SIZE];
+        flash.read(0, &mut sb).map_err(flash_error)?;
+        Ok(Layout::from_superblock(&sb)
+            .and_then(|(_, magic)| Network::from_magic(bitcoin::p2p::Magic::from_bytes(magic))))
+    }
+
     /// Mounts the store `flash` holds for `network`. Without one, formats the flash if `format`
     /// (erasing what it holds, which takes minutes on a large flash) and returns `true` with the
     /// store, else fails.
