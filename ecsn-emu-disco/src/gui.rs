@@ -1,6 +1,8 @@
-//! The window (BLIT): the board's display at its size, under it the board
-//! with its four user LEDs, its network address, the chain's validated tip,
-//! the emulation's pace and a RESET button; the firmware's logs beside them.
+//! The window (BLIT): the board, its front photographed, with what its
+//! display shows in the display's place (or the display alone at its size),
+//! under it its four user LEDs, its network address, the chain's validated
+//! tip, the emulation's pace and the RESET button; the firmware's logs beside
+//! them.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,9 +33,14 @@ static FONT: &[u8] = include_bytes!(env!("ECSN_EMU_FONT"));
 static FONT_MONO: &[u8] = include_bytes!(env!("ECSN_EMU_FONT_MONO"));
 const MONO: FontId = FontId(1);
 
-/// The frame around the display.
+/// The frame around the display, shown alone.
 const BEZEL: f32 = 16.0;
 const BOARD_WIDTH: f32 = SCREEN.0 as f32 + 2.0 * BEZEL;
+/// The board's front, from ST's product page (`assets/stm32h747i-disco.avif`,
+/// as PNG), and where the display's active area is in it.
+static PHOTO: &[u8] = include_bytes!("../assets/stm32h747i-disco.png");
+const PHOTO_SIZE: (f32, f32) = (1000.0, 743.0);
+const PHOTO_SCREEN: (f32, f32, f32) = (202.0, 83.0, 611.0);
 const SIDE_WIDTH: f32 = 560.0;
 const GAP: f32 = 18.0;
 const LOG_LINE: f32 = 16.0;
@@ -76,6 +83,21 @@ struct App {
     seen_logs: u64,
     /// The display's picture, and the screen generation it shows.
     screen: Option<(u64, ImageHandle)>,
+    /// The board's photograph, if it decodes.
+    photo: Option<ImageHandle>,
+    /// Show the display alone, at its size, instead of on the board.
+    actual_size: bool,
+}
+
+/// The photograph, RGBA.
+fn decode_photo() -> Result<(u32, u32, Vec<u8>), png::DecodingError> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(PHOTO));
+    decoder.set_transformations(png::Transformations::ALPHA);
+    let mut reader = decoder.read_info()?;
+    let mut rgba = vec![0; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut rgba)?;
+    rgba.truncate(info.buffer_size());
+    Ok((info.width, info.height, rgba))
 }
 
 fn text(ui: Ui<'_>, text: &str, size: f32, color: Color) {
@@ -110,7 +132,21 @@ impl Application for App {
     type Input = Wake;
     type Graphics = cpu::Backend;
 
-    fn new(proxy: EventLoopProxy<Wake>, _: Scope<Self>, _: &mut Ctx) -> Self {
+    fn new(proxy: EventLoopProxy<Wake>, _: Scope<Self>, ctx: &mut Ctx) -> Self {
+        let photo = match decode_photo() {
+            Ok((width, height, rgba)) => ctx
+                .create_image(ImageData::new(
+                    ImagePixels::Owned(rgba.into_boxed_slice()),
+                    ImageFormat::Rgba8,
+                    width,
+                    height,
+                ))
+                .ok(),
+            Err(e) => {
+                eprintln!("ecsn-emu-disco: board photo not shown: {e}");
+                None
+            }
+        };
         let launch = HANDOFF.lock().unwrap().take().expect("emulator handoff");
         let session = Session::start(launch.elf, launch.qspi, launch.panel, move || {
             let _ = proxy.send_event(Wake);
@@ -122,6 +158,8 @@ impl Application for App {
             logs_scroll: ScrollState::default(),
             seen_logs: 0,
             screen: None,
+            photo,
+            actual_size: false,
         }
     }
 
@@ -132,14 +170,62 @@ impl Application for App {
         let mut root = ui.layout(flex::row().gap(GAP)).pad(GAP);
         root.insert(Rectangle::new().background(BACKGROUND));
         let reset;
+        let mut toggle = false;
 
-        // The display, then the board.
+        // The display on the board's photograph, or alone; then the board's
+        // state.
         {
+            let on_board = self.photo.is_some() && !self.actual_size;
+            let width = if on_board { PHOTO_SIZE.0 } else { BOARD_WIDTH };
             let mut left = root
                 .child()
-                .item(flex::item().width(Sizing::fixed(BOARD_WIDTH)))
+                .item(flex::item().width(Sizing::fixed(width)))
                 .layout(flex::column().gap(14.0));
+            let screen = &snap.screen;
+            if !screen.frame.rgba.is_empty()
+                && self
+                    .screen
+                    .as_ref()
+                    .is_none_or(|(generation, _)| *generation != screen.generation)
             {
+                let image = left
+                    .context_mut()
+                    .create_image(ImageData::new(
+                        ImagePixels::Owned(screen.frame.rgba.clone().into_boxed_slice()),
+                        ImageFormat::Rgba8,
+                        screen.frame.width,
+                        screen.frame.height,
+                    ))
+                    .expect("display image");
+                self.screen = Some((screen.generation, image));
+            }
+            if let Some(photo) = self.photo.as_ref().filter(|_| on_board) {
+                // The picture fills the display's active area, scaled down to
+                // the photograph's.
+                let (x, y, w) = PHOTO_SCREEN;
+                let h = w * SCREEN.1 as f32 / SCREEN.0 as f32;
+                let mut board = left
+                    .child()
+                    .item(
+                        flex::item()
+                            .width(Sizing::fixed(PHOTO_SIZE.0))
+                            .height(Sizing::fixed(PHOTO_SIZE.1)),
+                    )
+                    .layout(flex::column())
+                    .pad(Sides::new().left(x).top(y));
+                board.insert(Image::new(photo).sampling(ImageSampling::Bilinear));
+                let mut glass = board.child().item(
+                    flex::item()
+                        .width(Sizing::fixed(w))
+                        .height(Sizing::fixed(h)),
+                );
+                match &self.screen {
+                    Some((_, image)) => {
+                        glass.insert(Image::new(image).sampling(ImageSampling::Bilinear))
+                    }
+                    None => glass.insert(Rectangle::new().background(Color::rgb(0, 0, 0))),
+                }
+            } else {
                 let mut bezel = left.child().layout(flex::column()).pad(BEZEL);
                 bezel.insert(
                     Rectangle::new()
@@ -147,24 +233,6 @@ impl Application for App {
                         .border(Border::solid(2.0, Color::rgb(0x2a, 0x2e, 0x36)))
                         .radius(BorderRadius::uniform(10.0)),
                 );
-                let screen = &snap.screen;
-                if !screen.frame.rgba.is_empty()
-                    && self
-                        .screen
-                        .as_ref()
-                        .is_none_or(|(generation, _)| *generation != screen.generation)
-                {
-                    let image = bezel
-                        .context_mut()
-                        .create_image(ImageData::new(
-                            ImagePixels::Owned(screen.frame.rgba.clone().into_boxed_slice()),
-                            ImageFormat::Rgba8,
-                            screen.frame.width,
-                            screen.frame.height,
-                        ))
-                        .expect("display image");
-                    self.screen = Some((screen.generation, image));
-                }
                 let mut glass = bezel.child().item(
                     flex::item()
                         .width(Sizing::fixed(SCREEN.0 as f32))
@@ -179,7 +247,7 @@ impl Application for App {
             }
             let mut board = left
                 .child()
-                .item(flex::item().width(Sizing::fixed(BOARD_WIDTH)))
+                .item(flex::item().width(Sizing::fixed(width)))
                 .layout(flex::row().gap(28.0).align(Align::Center))
                 .pad(16.0);
             board.insert(
@@ -247,7 +315,15 @@ impl Application for App {
             state
                 .child()
                 .build(|ui: Ui<'_>| text(ui, &format!("Validated up to: {validated}"), 14.0, TEXT));
-            reset = state.child().build(|ui: Ui<'_>| button(ui, "RESET"));
+            let mut buttons = state.child().layout(flex::row().gap(10.0));
+            reset = buttons.child().build(|ui: Ui<'_>| button(ui, "RESET"));
+            if self.photo.is_some() {
+                let label = if on_board { "DISPLAY 1:1" } else { "BOARD" };
+                toggle = buttons.child().build(|ui: Ui<'_>| button(ui, label));
+            }
+        }
+        if toggle {
+            self.actual_size = !self.actual_size;
         }
 
         // The logs.
@@ -346,8 +422,8 @@ pub fn run(elf: Vec<u8>, qspi: Option<PathBuf>, panel: Controller) {
     *HANDOFF.lock().unwrap() = Some(Launch { elf, qspi, panel });
     blit_desktop::run::<App>(Config {
         title: "STM32H747I-DISCO emulator".into(),
-        width: (BOARD_WIDTH + SIDE_WIDTH + 3.0 * GAP) as u32,
-        height: 730,
+        width: (PHOTO_SIZE.0 + SIDE_WIDTH + 3.0 * GAP) as u32,
+        height: 930,
         graphics,
     })
     .expect("window");

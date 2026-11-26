@@ -138,8 +138,10 @@ cd ../ecsn-emu-disco && cargo run --release -- --qspi /tmp/disco.img            
 cargo run --release -- --headless --seconds 30 --realtime --qspi /tmp/disco.img  # logs on stdout
 ```
 
-The window shows the display at its size, under it the four LEDs, the address, the validated tip,
-the pace and a RESET button, beside the decoded defmt logs. Headless: `--screen-png FILE` saves what
+The window shows the board, from the photograph of its front on ST's product page
+(`ecsn-emu-disco/assets`), with what the display shows in the display's place (DISPLAY 1:1 shows the
+display alone, at its size), under it the four LEDs, the address, the validated tip, the pace and a
+RESET button, beside the decoded defmt logs. Headless: `--screen-png FILE` saves what
 the display shows at the end, `--realtime` keeps virtual time no faster than the wall clock (for
 real peers; a board fallen behind, its core busy, does not catch up), `--profile SECONDS` samples
 the PC every millisecond and prints the busiest functions with their callers for each interval of
