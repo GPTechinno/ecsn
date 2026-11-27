@@ -42,9 +42,6 @@ pub struct Config {
     pub blocks_in_flight: usize,
 }
 
-/// Validated blocks between two flushes of the chain while syncing, so that a reset loses
-/// little of a long sync.
-const FLUSH_EVERY: u32 = 100;
 /// Validated heights between two progress lines while syncing.
 const PROGRESS_EVERY: u32 = 1000;
 
@@ -337,7 +334,6 @@ impl<S: ChainStore> Node<S> {
         let (best, _) = self.chain.get_best_block()?;
         let mut asked = self.chain.get_validation_index()?;
         let mut in_flight: VecDeque<InFlight> = VecDeque::new();
-        let mut validated = 0;
         loop {
             let mut inventory = Vec::new();
             while asked < best && in_flight.len() < window {
@@ -379,11 +375,10 @@ impl<S: ChainStore> Node<S> {
                     block.txdata.len(),
                     leaf_data.len()
                 );
-                validated += 1;
                 progress = true;
-                if validated % FLUSH_EVERY == 0 {
-                    self.chain.flush()?;
-                }
+                // the block's header, index and accumulator are in the store already: the best
+                // chain with them, a reset resumes after this block
+                self.chain.flush()?;
                 if height % PROGRESS_EVERY == 0 {
                     info!("validated up to {height} of {best}");
                 }
