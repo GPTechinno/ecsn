@@ -135,8 +135,9 @@ impl Resolver for SystemResolver {
     }
 }
 
-fn heap_free() -> usize {
-    HEAP.free()
+/// The bytes left under the limit, as one block: the system's allocator does not fragment it.
+fn heap_free() -> (usize, usize) {
+    (HEAP.free(), HEAP.free())
 }
 
 fn unix_now() -> i64 {
@@ -183,7 +184,7 @@ async fn main() -> ExitCode {
         v2: !args.v1,
         v2_bridge: !args.v1,
         // the blocks in flight fit the heap left under the limit, as on a board
-        free_memory: args.heap_limit.map(|_| heap_free as fn() -> usize),
+        free_memory: args.heap_limit.map(|_| heap_free as fn() -> (usize, usize)),
     };
 
     let Some(path) = &args.store else {

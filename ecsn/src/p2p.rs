@@ -739,16 +739,32 @@ pub struct Connection<T> {
     /// Bytes read ahead during the v2 handshake, taken before the stream's.
     ahead: Vec<u8>,
     /// The message being received, as far as read: its header (24 bytes in v1, the 3 bytes of
-    /// the encrypted length in v2), then its payload (the packet in v2).
+    /// the encrypted length in v2), then its payload (the packet in v2). The payload's buffer is
+    /// kept from one message to the next, grown to the largest: a heap is not cut up by a large
+    /// buffer freed after each message.
     head: [u8; 24],
     head_read: usize,
     payload: Vec<u8>,
     payload_read: usize,
 }
 
+/// Makes `buffer` `len` bytes long, growing its capacity to that exactly if it must.
+fn size_to(buffer: &mut Vec<u8>, len: usize) {
+    if len > buffer.capacity() {
+        buffer.reserve_exact(len - buffer.len());
+    }
+    buffer.resize(len, 0);
+}
+
 impl<T: Read + Write> Connection<T> {
     /// A connection in the v1 transport.
     pub fn new(io: T, network: Network) -> Self {
+        Self::with_buffer(io, network, Vec::new())
+    }
+
+    /// A connection in the v1 transport receiving into `buffer`, that of an earlier connection
+    /// ([`Connection::into_buffer`]).
+    pub fn with_buffer(io: T, network: Network, buffer: Vec<u8>) -> Self {
         Self {
             io,
             magic: network.magic().to_bytes(),
@@ -756,9 +772,14 @@ impl<T: Read + Write> Connection<T> {
             ahead: Vec::new(),
             head: [0; 24],
             head_read: 0,
-            payload: Vec::new(),
+            payload: buffer,
             payload_read: 0,
         }
+    }
+
+    /// The buffer the connection received into, for the next one.
+    pub fn into_buffer(self) -> Vec<u8> {
+        self.payload
     }
 
     /// Whether the connection is in the v2 transport.
@@ -909,20 +930,19 @@ impl<T: Read + Write> Connection<T> {
                 if len as usize > MAX_PAYLOAD {
                     return Err(Error::Oversized(len));
                 }
-                self.payload = vec![0; len as usize];
+                size_to(&mut self.payload, len as usize);
                 self.payload_read = 0;
             }
         }
         self.read_payload().await?;
         // the whole message is here: the next call starts another
         self.head_read = 0;
-        let payload = core::mem::take(&mut self.payload);
-        if sha256d::Hash::hash(&payload)[..4] != self.head[20..] {
+        if sha256d::Hash::hash(&self.payload)[..4] != self.head[20..] {
             return Err(Error::Checksum);
         }
         let mut command = [0; 12];
         command.copy_from_slice(&self.head[4..16]);
-        Message::decode(&command, &payload).map_err(|error| Error::Decode { command, error })
+        Message::decode(&command, &self.payload).map_err(|error| Error::Decode { command, error })
     }
 
     /// Reads the rest of the payload being received.
@@ -964,17 +984,16 @@ impl<T: Read + Write> Connection<T> {
                     if len > MAX_PAYLOAD + 13 + V2_OVERHEAD {
                         return Err(Error::Oversized(len as u32));
                     }
-                    self.payload = vec![0; len];
+                    size_to(&mut self.payload, len);
                     self.payload_read = 0;
                 }
             }
             self.read_payload().await?;
             self.head_read = 0;
-            let mut packet = core::mem::take(&mut self.payload);
             let v2 = self.v2.as_mut().expect("a v2 connection");
             let (kind, plain) = v2
                 .inbound
-                .decrypt_in_place(&mut packet, None)
+                .decrypt_in_place(&mut self.payload, None)
                 .map_err(Error::V2)?;
             if kind == PacketType::Decoy {
                 continue;

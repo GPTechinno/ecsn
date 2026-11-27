@@ -42,7 +42,9 @@ blit-text = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d38
 blit-widget = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83", default-features = false }
 embedded-io-async = "0.7"
 stm32-fmc = "0.4.0"
-embedded-alloc = { version = "0.7.0", default-features = false, features = ["tlsf"] }
+# the heap's allocator, with its list of blocks (`unstable`) for its largest free block
+rlsf = { version = "0.2.3", features = ["unstable"] }
+critical-section = "1.2"
 static_cell = "2.1"
 
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }

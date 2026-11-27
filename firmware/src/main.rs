@@ -15,8 +15,9 @@
 //! - `ECSN_NETWORK`: `bitcoin`, `testnet`, `testnet4`, `signet` or `regtest` (the default);
 //! - `ECSN_ASSUME_UTREEXO`: set to start from `floresta-chain`'s accumulator of the network;
 //! - `ECSN_RAM_STORE`: set to keep the chain in RAM instead, lost on reset;
-//! - `ECSN_BLOCKS_IN_FLIGHT`: blocks asked for at once while syncing, 4 by default (each is held
-//!   in RAM until validated, up to a few megabytes on mainnet);
+//! - `ECSN_BLOCKS_IN_FLIGHT`: blocks asked for at once while syncing, 2 by default: one validated
+//!   while the next comes (each is held in RAM until validated, a few megabytes on mainnet, and
+//!   fewer are asked for when the heap has not room for them);
 //! - `ECSN_LOG`: the most detailed log level of the node (`info` by default);
 //! - `ECSN_NTP`: the SNTP server, a name or an IPv4 address, `pool.ntp.org` by default.
 //!
@@ -28,7 +29,7 @@
 //! watchdog (IWDG1, 32 s) is armed once the node reaches the block sync, past the one-off steps
 //! that hold the core longer (marking the chain as assumed); from then on a core held 32 s resets
 //! the board, which resumes from the flash. The executor's stalls and the heap's peak are logged
-//! as they grow.
+//! as they grow, the heap's largest free block as it shrinks.
 //!
 //! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to a bridge.
 //! The display shows the step the firmware is at while it starts, then the node's state, redrawn
@@ -468,14 +469,14 @@ async fn main(spawner: Spawner) {
         user_agent: concat!("/ecsn:", env!("CARGO_PKG_VERSION"), "/").into(),
         assume_utreexo: ASSUME_UTREEXO.then(|| ChainParams::get_assume_utreexo(network)),
         blocks_in_flight: match BLOCKS_IN_FLIGHT.map(str::parse) {
-            None => 4,
+            None => 2,
             Some(Ok(n)) => n,
             Some(Err(_)) => defmt::panic!("ECSN_BLOCKS_IN_FLIGHT: not a number"),
         },
         ipv6: false,
         v2: !V1,
         v2_bridge: !V1_BRIDGE && !V1,
-        free_memory: Some(|| HEAP.free()),
+        free_memory: Some(|| HEAP.free_and_largest()),
     };
     let link = Link {
         stack,
@@ -809,6 +810,7 @@ async fn follow<S: ChainStore>(
         let mut armed = false;
         let mut longest = Duration::from_ticks(0);
         let mut heap_peak = 0;
+        let mut smallest_largest = usize::MAX;
         let mut last = Instant::now();
         loop {
             Timer::after(GUARD_PERIOD).await;
@@ -840,14 +842,18 @@ async fn follow<S: ChainStore>(
             } else {
                 connected.set_high();
             }
+            // the peak as it grows by a MB, the largest free block as it shrinks by one
             let peak = HEAP.peak();
-            if peak >= heap_peak + (1 << 20) {
-                heap_peak = peak;
+            let (free, largest) = HEAP.free_and_largest();
+            if peak >= heap_peak + (1 << 20) || largest + (1 << 20) <= smallest_largest {
+                heap_peak = heap_peak.max(peak);
+                smallest_largest = smallest_largest.min(largest);
                 info!(
-                    "heap: {=usize} KB allocated at most, {=usize} KB now, {=usize} KB of the SDRAM taken",
+                    "heap: {=usize} KB allocated at most, {=usize} KB now, {=usize} KB free, its largest block {=usize} KB",
                     peak >> 10,
                     HEAP.allocated() >> 10,
-                    (sdram::SIZE - HEAP.free()) >> 10
+                    free >> 10,
+                    largest >> 10
                 );
             }
         }

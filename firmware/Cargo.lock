@@ -522,6 +522,7 @@ dependencies = [
  "blit-widget",
  "cortex-m",
  "cortex-m-rt",
+ "critical-section",
  "defmt 1.2.0",
  "defmt-rtt",
  "ecsn",
@@ -530,11 +531,11 @@ dependencies = [
  "embassy-net",
  "embassy-stm32",
  "embassy-time",
- "embedded-alloc",
  "embedded-io-async 0.7.0",
  "floresta-chain",
  "fontdue",
  "panic-probe",
+ "rlsf",
  "smoltcp",
  "static_cell",
  "stm32-fmc",
@@ -773,17 +774,6 @@ dependencies = [
  "embassy-time",
  "embassy-usb-driver",
  "portable-atomic",
-]
-
-[[package]]
-name = "embedded-alloc"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2db634e07f552215f7a3572dc0a4d29760c637fcea5a8c18d2cc291f782c216c"
-dependencies = [
- "const-default",
- "critical-section",
- "rlsf",
 ]
 
 [[package]]

@@ -61,9 +61,10 @@ pub struct Config {
     pub v2: bool,
     /// Whether it is tried with the bridge too, whose blocks then cost their decryption.
     pub v2_bridge: bool,
-    /// The bytes the heap has left, if known: while syncing, a block is asked for only if they
-    /// leave room for it (beyond the first block in flight, always asked for).
-    pub free_memory: Option<fn() -> usize>,
+    /// The bytes the heap has left and its largest free block, if known: while syncing, a block
+    /// is asked for only if they leave room for it (beyond the first block in flight, always
+    /// asked for).
+    pub free_memory: Option<fn() -> (usize, usize)>,
 }
 
 /// Validated heights between two progress lines while syncing.
@@ -75,6 +76,9 @@ const MEMORY_RESERVE: usize = 8 << 20;
 /// The heap a block asked for takes once here (a mainnet block of 2 MB takes about twice that
 /// decoded), counted for each block asked and not here yet.
 const BLOCK_ROOM: usize = 4 << 20;
+/// The largest free block kept while syncing: a block's decoding and validation allocate pieces
+/// of up to about 600 KB at once (its transactions, its proof's hashes).
+const CONTIGUOUS_RESERVE: usize = 2 << 20;
 
 /// Seconds a slot waits when the book has no address for it.
 const IDLE: u64 = 5;
@@ -721,13 +725,15 @@ impl<S: ChainStore> Node<S> {
     }
 
     /// Whether the heap left takes one more block asked for: the reserve, and the room of each
-    /// block asked and not here yet, that one included. Yes when the heap left is not known.
+    /// block asked and not here yet, that one included, with a free block of
+    /// [`CONTIGUOUS_RESERVE`] at least. Yes when the heap left is not known.
     fn room_for_another(&self, in_flight: &VecDeque<InFlight>) -> bool {
-        let Some(free) = self.config.free_memory else {
+        let Some(free_memory) = self.config.free_memory else {
             return true;
         };
+        let (free, largest) = free_memory();
         let coming = in_flight.iter().filter(|b| b.block.is_none()).count() + 1;
-        free() >= MEMORY_RESERVE + coming * BLOCK_ROOM
+        free >= MEMORY_RESERVE + coming * BLOCK_ROOM && largest >= CONTIGUOUS_RESERVE
     }
 
     /// Validates the block at `height`, the one after the last validated, with the outputs it
@@ -1023,6 +1029,8 @@ impl<S: ChainStore> Node<S> {
             Role::Bridge => "bridge",
             Role::Peer => "peer",
         };
+        // the slot's receive buffer, kept from one connection to the next
+        let mut buffer = Vec::new();
         loop {
             let picked = self.book.borrow_mut().pick(role, clock.now());
             let Some(addr) = picked else {
@@ -1042,7 +1050,8 @@ impl<S: ChainStore> Node<S> {
                     debug!("{name} {addr}: not reached");
                     break Outcome::Unreached;
                 };
-                let mut conn = Connection::new(io, self.config.network);
+                let mut conn =
+                    Connection::with_buffer(io, self.config.network, core::mem::take(&mut buffer));
                 let now = clock.unix();
                 let keyed = Cell::new(false);
                 let run = async {
@@ -1064,6 +1073,7 @@ impl<S: ChainStore> Node<S> {
                     }
                 };
                 let result = select(run, handshake).await;
+                buffer = conn.into_buffer();
                 if v2 && !keyed.get() {
                     match &result {
                         Either::First(Err(e)) => debug!("{name} {addr}: no v2 ({e:?}), v1"),

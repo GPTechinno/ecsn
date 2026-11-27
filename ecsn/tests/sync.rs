@@ -99,7 +99,7 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
 fn sync_in(
     blocks_in_flight: usize,
     order: Order,
-    free_memory: Option<fn() -> usize>,
+    free_memory: Option<fn() -> (usize, usize)>,
 ) -> Vec<usize> {
     let fixture = fixture();
     let config = Config {
@@ -149,12 +149,17 @@ fn sync_in(
     asked
 }
 
-fn ten_mib() -> usize {
-    10 << 20
+fn ten_mib() -> (usize, usize) {
+    (10 << 20, 10 << 20)
 }
 
-fn eighteen_mib() -> usize {
-    18 << 20
+fn eighteen_mib() -> (usize, usize) {
+    (18 << 20, 18 << 20)
+}
+
+/// 30 MiB free, but in pieces of 1 MiB at most.
+fn fragmented() -> (usize, usize) {
+    (30 << 20, 1 << 20)
 }
 
 #[test]
@@ -170,6 +175,12 @@ fn two_blocks_at_a_time_when_the_heap_has_room_for_two() {
     let asked = sync_in(8, Order::AsAsked, Some(eighteen_mib));
     assert_eq!(asked[0], 2);
     assert!(asked.iter().all(|n| *n <= 2), "{asked:?}");
+}
+
+#[test]
+fn one_block_at_a_time_when_the_heap_is_in_small_pieces() {
+    let asked = sync_in(8, Order::AsAsked, Some(fragmented));
+    assert!(asked.iter().all(|n| *n == 1), "{asked:?}");
 }
 
 #[test]

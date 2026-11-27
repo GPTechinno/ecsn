@@ -60,11 +60,15 @@ ecsn-regtest fill --blocks 10 --pairs 4
 ecsn-host --network regtest            # or --follow to keep following new blocks
 ```
 
-While syncing, the node asks for `--blocks-in-flight` blocks at once (16 by default, 4 on the
-board), the proof of each as it comes, and validates them in order; it saves the chain after each
-block validated. When the heap left is known (the board's, or under `--heap-limit`), it asks for
-fewer: beyond the first block in flight, one more only if the heap left keeps 8 MiB free for a
-validation and the decoding of a block, plus 4 MiB for each block asked and not here yet.
+While syncing, the node asks for `--blocks-in-flight` blocks at once (16 by default, 2 on the
+board, where one validated while the next comes keeps it busy), the proof of each as it comes, and
+validates them in order; it saves the chain after each block validated. When the heap left is
+known (the board's, or under `--heap-limit`), it asks for fewer: beyond the first block in flight,
+one more only if the heap left keeps 8 MiB free for a validation and the decoding of a block, plus
+4 MiB for each block asked and not here yet, and a free block of 2 MiB (a heap in small pieces
+fails the allocations of a validation). Each connection receives into one buffer, kept from one
+message to the next and across the slot's connections, grown to the largest message: a large
+buffer freed after each block would cut the heap up.
 
 With `--follow` the node keeps a connection to a bridge (the peer given first, then any address
 whose services include `NODE_UTREEXO_ARCHIVE`) and `--peers` (2 by default) to ordinary peers, each
@@ -155,7 +159,7 @@ connected.
 The firmware logs at its start what reset the chip (power-on, the reset pin, the watchdog,
 software). Its watchdog (IWDG1, 32 s) is armed once the node reaches the block sync, past the
 one-off steps that hold the core longer; from then on a core held 32 s resets the board, which
-resumes from the flash. The executor's stalls and the heap's peak are logged as they grow.
+resumes from the flash. The executor's stalls and the heap's peak are logged as they grow, the heap's largest free block as it shrinks.
 
 The 4" display (800 × 480, MIPI DSI) shows, drawn with BLIT, the step the firmware is at while it
 starts (DHCP, the chain store), then the node, redrawn every second: the validated height out of the best header with
