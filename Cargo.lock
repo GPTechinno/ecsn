@@ -101,6 +101,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
+name = "bip324"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ed414c4fcc415f4899990cdc04d5fa6c7cd5673042c43bde1943250df8a59c7"
+dependencies = [
+ "bitcoin_hashes 0.16.0",
+ "chacha20-poly1305",
+ "secp256k1",
+]
+
+[[package]]
 name = "bitcoin"
 version = "0.32.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,6 +198,12 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_hashes"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e5d09f16329cd545d7e6008b2c6b2af3a90bc678cf41ac3d2f6755943301b16"
+
+[[package]]
+name = "bitcoin_hashes"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a67800fcf7f3ca52f7796d4466948a424326b225950c79d1e76d0458760bb25d"
@@ -218,6 +235,12 @@ name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "chacha20-poly1305"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b4b0fc281743d80256607bd65e8beedc42cb0787ea119c85b81b4c0eab85e5f"
 
 [[package]]
 name = "clap"
@@ -298,12 +321,14 @@ dependencies = [
 name = "ecsn"
 version = "0.1.0"
 dependencies = [
+ "bip324",
  "bitcoin",
  "embassy-futures",
  "embedded-io-adapters",
  "embedded-io-async",
  "floresta-chain",
  "rustreexo",
+ "secp256k1",
  "tokio",
  "tracing",
 ]
@@ -312,6 +337,7 @@ dependencies = [
 name = "ecsn-host"
 version = "0.1.0"
 dependencies = [
+ "bip324",
  "bitcoin",
  "clap",
  "ecsn",

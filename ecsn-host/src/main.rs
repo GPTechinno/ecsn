@@ -57,6 +57,12 @@ struct Args {
     /// Reach peers over IPv6 too
     #[arg(long)]
     ipv6: bool,
+    /// Never the v2 transport (BIP 324), tried by default with the peers that speak it
+    #[arg(long)]
+    v1: bool,
+    /// Without `--follow`: the v2 transport with the peer
+    #[arg(long, conflicts_with = "v1")]
+    v2: bool,
     /// Keep the chain in this flash image (created, and formatted, if needed) instead of in RAM
     #[arg(long)]
     store: Option<PathBuf>,
@@ -85,6 +91,20 @@ impl Dialer for TcpDialer {
         let _ = stream.set_nodelay(true);
         Some(FromTokio::new(stream))
     }
+
+    fn random(&mut self) -> [u8; 64] {
+        random()
+    }
+}
+
+/// 64 random bytes from the system.
+fn random() -> [u8; 64] {
+    use std::io::Read;
+    let mut bytes = [0; 64];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("/dev/urandom");
+    bytes
 }
 
 struct TokioClock(Instant);
@@ -156,6 +176,8 @@ async fn main() -> ExitCode {
             .then(|| ChainParams::get_assume_utreexo(args.network)),
         blocks_in_flight: args.blocks_in_flight,
         ipv6: args.ipv6,
+        v2: !args.v1,
+        v2_bridge: !args.v1,
     };
 
     let Some(path) = &args.store else {
@@ -213,6 +235,13 @@ async fn run<S: ChainStore>(args: &Args, store: S, config: Config) -> ExitCode {
     };
     let _ = stream.set_nodelay(true);
     let mut conn = Connection::new(FromTokio::new(stream), args.network);
+    if args.v2 {
+        if let Err(e) = conn.start_v2(bip324::Role::Initiator, random()).await {
+            eprintln!("{peer}: v2 handshake: {e:?}");
+            return ExitCode::FAILURE;
+        }
+        info!("{peer}: v2 transport");
+    }
     let result = match node.handshake(&mut conn, unix_now()).await {
         Ok(_) => node.sync(&mut conn).await.map(|_| ()),
         Err(e) => Err(e),
@@ -272,8 +301,9 @@ async fn follow<S: ChainStore>(args: &Args, node: &Node<S>, peer: &str) -> ExitC
                     Role::Peer => "peer",
                 };
                 let addr = p.addr.map_or_else(|| "?".into(), |a| a.to_string());
+                let v2 = if p.v2 { " v2" } else { "" };
                 match &p.info {
-                    Some(info) => line += &format!(" {role} {addr} {}", info.user_agent),
+                    Some(info) => line += &format!(" {role} {addr} {}{v2}", info.user_agent),
                     None => line += &format!(" {role} {addr} (connecting)"),
                 }
             }

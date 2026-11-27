@@ -14,7 +14,7 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 
 | Crate | |
 |---|---|
-| `ecsn` | `no_std`: the P2P messages (v1 transport, BIP 183's `getuproof`/`uproof`, BIP 155's `addrv2`), chain stores in RAM and on NOR flash, the address book and the DNS seeds, the node over any `embedded-io-async` stream: a bridge's connection (handshake, header sync, block validation, following new blocks) and ordinary peers' (headers, block announcements, addresses), each in a slot that reconnects to another address when it ends |
+| `ecsn` | `no_std`: the P2P messages (the v1 transport and BIP 324's v2, BIP 183's `getuproof`/`uproof`, BIP 155's `addrv2`), chain stores in RAM and on NOR flash, the address book and the DNS seeds, the node over any `embedded-io-async` stream: a bridge's connection (handshake, header sync, block validation, following new blocks) and ordinary peers' (headers, block announcements, addresses), each in a slot that reconnects to another address when it ends |
 | `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file |
 | `ecsn-regtest` | fills a regtest node with blocks spending outputs of earlier blocks and of their own |
 | `ecsn-emu-disco` | the STM32H747I-DISCO emulated (`emulator/stm32h7-rax` with the board around it), to run and debug the firmware: a BLIT window or headless. Its own workspace, built from its directory with BLIT's nightly Rust |
@@ -71,6 +71,12 @@ their headers are checked and added to the header chain, and the bridge's connec
 blocks once the bridge has them (a `notfound` from it waits for its announcement). `ecsn-host`
 logs the connections every minute. IPv4 only unless `--ipv6`.
 
+The v2 transport (BIP 324: a key exchange, then encrypted packets) is tried with the peers whose
+services include `NODE_P2P_V2` and with the configured bridge; when its handshake fails the slot
+connects again at once in v1, and keeps to v1 with that address. utreexod speaks it, with the
+one-byte IDs 29 and 30 for `uproof` and `getuproof`. `--v1` never tries it; without `--follow`,
+`--v2` speaks it with the peer.
+
 (`--configfile` naming an empty file keeps utreexod from creating `~/.utreexod`.) `ecsn-host`
 prints the validated tip and its accumulator; utreexod's `getutreexoroots <hash>` gives its own
 to compare.
@@ -120,6 +126,11 @@ Optional build-time settings:
 - `ECSN_NETWORK`: `regtest` by default.
 - `ECSN_PEERS`: the ordinary peers kept connected, 2 by default (with the bridge, as `ecsn-host
   --follow` does; the DNS seeds through the network's DNS).
+- `ECSN_V1`: set it to keep to the v1 transport; by default the v2 (BIP 324) is tried as
+  `ecsn-host --follow` does, its keys from the chip's RNG.
+- `ECSN_V1_BRIDGE`: set it to keep the bridge alone in the v1 transport. In v2 its blocks cost their
+  decryption, about 6 % of the core while syncing (the `chacha20-poly1305` crate built at
+  `opt-level = 3`; a quarter at the profile's `"s"`).
 - `ECSN_ASSUME_UTREEXO`: set it to start from `floresta-chain`'s accumulator.
 - `ECSN_RAM_STORE`: set it to keep the chain in RAM instead of on the QSPI flash.
 - `ECSN_LOG`: the log level, `info` by default.
@@ -145,7 +156,8 @@ resumes from the flash. The executor's stalls and the heap's peak are logged as 
 The 4" display (800 × 480, MIPI DSI) shows, drawn with BLIT, the step the firmware is at while it
 starts (DHCP, the chain store), then the node, redrawn every second: the validated height out of the best header with
 its progress, the validated tip (hash, time, age, transactions, inputs proven, size), the node's
-phase, the peers (the bridge and the ordinary peers: address and client, the addresses known),
+phase, the peers (the bridge and the ordinary peers: address, client, `v2` when encrypted, the
+addresses known),
 the board's address and MAC, the flash and heap in use, the accumulator. Until SNTP answers, the
 clock is the bridge's, taken from its `version` message. The firmware tells the panel's controller (OTM8009A on the first boards, NT35510 on later
 ones) from its ID, and runs without the display if neither answers.
@@ -208,7 +220,9 @@ ends a headless run as `--seconds` does: the statistics, the profile, the QSPI i
   tests also check blocks sent in reverse (`ecsn/tests/sync.rs`, a peer answering from the
   fixture).
 - One bridge at a time and a few ordinary peers (`ecsn/tests/peers.rs`; checked on mainnet from
-  the host and the emulated board), the v1 transport (no BIP 324), no mempool, no script check.
+  the host and the emulated board), the v1 and v2 transports (`ecsn/src/p2p.rs`'s tests: messages
+  both ways, a 162 kB message received with its receive dropped every millisecond, a v1 peer; the
+  bridge and Bitcoin Core 32.1 peers in v2 on mainnet), no mempool, no script check.
 - The firmware runs on the emulated board (not yet on a real one): SDRAM, Ethernet with DHCP, the
   chain store formatted and mounted on the QSPI flash, synced and following utreexod, restarted and
   reorged; and on signet with assume-utreexo, from an erased flash to the tip, through the public

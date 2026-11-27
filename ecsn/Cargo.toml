@@ -13,6 +13,9 @@ floresta-chain.workspace = true
 rustreexo.workspace = true
 embedded-io-async.workspace = true
 embassy-futures.workspace = true
+bip324.workspace = true
+# the v2 transport's key exchange: a context on the heap
+secp256k1 = { version = "0.29", default-features = false, features = ["alloc"] }
 tracing.workspace = true
 
 [dev-dependencies]

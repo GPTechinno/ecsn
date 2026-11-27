@@ -27,6 +27,8 @@ fn node() -> Node<MemChainStore> {
         assume_utreexo: None,
         blocks_in_flight: 8,
         ipv6: false,
+        v2: true,
+        v2_bridge: true,
     };
     Node::new(MemChainStore::new(), config, 0).unwrap()
 }
@@ -75,7 +77,26 @@ fn proof(fixture: &Fixture, get: &ecsn::p2p::GetUtreexoProof) -> Message {
 /// A bridge that has blocks up to 110 until it is asked for headers a second time, then up to
 /// 111, which it never announces; it hangs up once it sent block 111's proof.
 async fn bridge_of_110(io: DuplexStream, fixture: &Fixture) {
+    serve_110(
+        Connection::new(FromTokio::new(io), Network::Regtest),
+        fixture,
+    )
+    .await
+}
+
+/// [`bridge_of_110`] in the v2 transport.
+async fn bridge_of_110_v2(io: DuplexStream, fixture: &Fixture) {
     let mut conn = Connection::new(FromTokio::new(io), Network::Regtest);
+    if conn
+        .start_v2(bip324::Role::Responder, [7; 64])
+        .await
+        .is_ok()
+    {
+        serve_110(conn, fixture).await
+    }
+}
+
+async fn serve_110(mut conn: Connection<FromTokio<DuplexStream>>, fixture: &Fixture) {
     let mut asked_headers = 0;
     while let Ok(message) = conn.recv().await {
         let answers = match message {
@@ -300,6 +321,25 @@ impl Dialer for OneStream {
     async fn connect(&mut self, _: SocketAddr) -> Option<Self::Io<'_>> {
         self.0.take().map(FromTokio::new)
     }
+
+    fn random(&mut self) -> [u8; 64] {
+        [3; 64]
+    }
+}
+
+/// Hands out its streams in turn, then none.
+struct Streams(std::collections::VecDeque<DuplexStream>);
+
+impl Dialer for Streams {
+    type Io<'a> = FromTokio<DuplexStream>;
+
+    async fn connect(&mut self, _: SocketAddr) -> Option<Self::Io<'_>> {
+        self.0.pop_front().map(FromTokio::new)
+    }
+
+    fn random(&mut self) -> [u8; 64] {
+        [5; 64]
+    }
 }
 
 struct TokioClock(Instant);
@@ -340,10 +380,74 @@ fn the_bridge_slot_connects_to_the_configured_peer() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
-        let all = async { tokio::join!(slot, bridge_of_110(theirs, &fixture), watch) };
+        // the configured peer is tried in v2 first
+        let all = async { tokio::join!(slot, bridge_of_110_v2(theirs, &fixture), watch) };
         until(all, || node.chain().get_validation_index().unwrap() == 110).await;
     });
     assert_eq!(seen.get(), Some(configured));
     let status = node.status();
     assert_eq!((status.known, status.known_bridges), (1, 1));
+}
+
+/// The bridge's slot to a bridge that says it speaks v2 (`addr`), served by `first` then
+/// `second` on the streams it opens: the slot's status once it validated up to 110, and whether
+/// the book still wants v2 with it.
+fn slot_to_a_v2_bridge<F1, F2>(
+    first: impl FnOnce(DuplexStream) -> F1,
+    second: impl FnOnce(DuplexStream) -> F2,
+) -> (ecsn::node::PeerStatus, usize)
+where
+    F1: std::future::Future<Output = ()>,
+    F2: std::future::Future<Output = ()>,
+{
+    let node = node();
+    let addr: SocketAddr = "5.6.7.8:18444".parse().unwrap();
+    assert!(node.add_address(addr, BRIDGE | services::P2P_V2, Source::Peer));
+    let seen = std::cell::RefCell::new(None);
+    let streams = std::cell::Cell::new(0);
+    runtime().block_on(async {
+        let (a, a_far) = tokio::io::duplex(1 << 16);
+        let (b, b_far) = tokio::io::duplex(1 << 16);
+        let mut dialer = Streams([a, b].into());
+        let clock = TokioClock(Instant::now());
+        let slot = node.run_slot(0, Role::Bridge, &mut dialer, &clock);
+        let watch = async {
+            loop {
+                if let Some(bridge) = node.status().bridge() {
+                    if bridge.info.is_some() {
+                        *seen.borrow_mut() = Some(bridge.clone());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let all = async { tokio::join!(slot, first(a_far), second(b_far), watch) };
+        until(all, || node.chain().get_validation_index().unwrap() == 110).await;
+        streams.set(2 - dialer.0.len());
+    });
+    (
+        seen.into_inner().expect("the bridge's handshake"),
+        streams.get(),
+    )
+}
+
+#[test]
+fn the_bridge_slot_speaks_v2_with_a_bridge_that_does() {
+    let fixture = fixture();
+    let (bridge, streams) = slot_to_a_v2_bridge(|io| bridge_of_110_v2(io, &fixture), |_| async {});
+    assert!(bridge.v2);
+    assert_eq!(bridge.info.unwrap().user_agent, "/bridge/");
+    assert_eq!(streams, 1);
+}
+
+#[test]
+fn the_bridge_slot_falls_back_to_v1_when_v2_fails() {
+    let fixture = fixture();
+    // a v1 bridge that says it speaks v2: it hangs up at our key, then serves us in v1
+    let (bridge, streams) = slot_to_a_v2_bridge(
+        |io| bridge_of_110(io, &fixture),
+        |io| bridge_of_110(io, &fixture),
+    );
+    assert!(!bridge.v2);
+    assert_eq!(streams, 2);
 }

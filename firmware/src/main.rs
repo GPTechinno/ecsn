@@ -8,6 +8,10 @@
 //! Set at build time:
 //! - `ECSN_PEER` (required): the bridge tried first, `ip:port`, for example `192.168.1.10:18444`;
 //! - `ECSN_PEERS`: ordinary peers kept connected, 2 by default;
+//! - `ECSN_V1`: set to stay in the v1 transport, the v2 (BIP 324, encrypted) being tried with the
+//!   peers that speak it;
+//! - `ECSN_V1_BRIDGE`: set to keep the bridge alone in the v1 transport, its blocks then not
+//!   decrypted (about 6 % of the core while syncing);
 //! - `ECSN_NETWORK`: `bitcoin`, `testnet`, `testnet4`, `signet` or `regtest` (the default);
 //! - `ECSN_ASSUME_UTREEXO`: set to start from `floresta-chain`'s accumulator of the network;
 //! - `ECSN_RAM_STORE`: set to keep the chain in RAM instead, lost on reset;
@@ -50,7 +54,7 @@ mod text;
 
 use alloc::format;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, SocketAddr, SocketAddrV4};
 use core::str::FromStr;
@@ -104,6 +108,8 @@ const NETWORK: Option<&str> = option_env!("ECSN_NETWORK");
 const ASSUME_UTREEXO: bool = option_env!("ECSN_ASSUME_UTREEXO").is_some();
 const RAM_STORE: bool = option_env!("ECSN_RAM_STORE").is_some();
 const BLOCKS_IN_FLIGHT: Option<&str> = option_env!("ECSN_BLOCKS_IN_FLIGHT");
+const V1: bool = option_env!("ECSN_V1").is_some();
+const V1_BRIDGE: bool = option_env!("ECSN_V1_BRIDGE").is_some();
 /// The ordinary peers kept connected.
 const PEERS: usize = match option_env!("ECSN_PEERS") {
     Some(n) => parse_count(n),
@@ -386,10 +392,12 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    let mut rng = Rng::new(p.RNG, Irqs);
-    let seed = rng.next_u64();
-    let nonce = rng.next_u64();
-    let ntp_cookie = rng.next_u64();
+    static RNG: StaticCell<RefCell<Rng<'static, peripherals::RNG>>> = StaticCell::new();
+    let rng = RNG.init(RefCell::new(Rng::new(p.RNG, Irqs)));
+    let (seed, nonce, ntp_cookie) = {
+        let mut rng = rng.borrow_mut();
+        (rng.next_u64(), rng.next_u64(), rng.next_u64())
+    };
 
     // a locally administered address from the chip's unique ID
     let uid = embassy_stm32::uid::uid();
@@ -448,6 +456,8 @@ async fn main(spawner: Spawner) {
             Some(Err(_)) => defmt::panic!("ECSN_BLOCKS_IN_FLIGHT: not a number"),
         },
         ipv6: false,
+        v2: !V1,
+        v2_bridge: !V1_BRIDGE && !V1,
     };
     let link = Link {
         stack,
@@ -455,6 +465,7 @@ async fn main(spawner: Spawner) {
         mac,
         nonce,
         ntp_cookie,
+        rng,
         connected,
         watchdog,
     };
@@ -516,6 +527,8 @@ struct Link {
     mac: [u8; 6],
     nonce: u64,
     ntp_cookie: u64,
+    /// The hardware's random numbers, for the v2 transport's keys.
+    rng: &'static RefCell<Rng<'static, peripherals::RNG>>,
     connected: Output<'static>,
     watchdog: IndependentWatchdog<'static, IWDG1>,
 }
@@ -591,6 +604,7 @@ struct TcpDialer {
     stack: Stack<'static>,
     rx: &'static mut [u8],
     tx: &'static mut [u8],
+    rng: &'static RefCell<Rng<'static, peripherals::RNG>>,
 }
 
 impl Dialer for TcpDialer {
@@ -609,6 +623,15 @@ impl Dialer for TcpDialer {
         socket.set_timeout(Some(Duration::from_secs(600)));
         socket.set_keep_alive(Some(Duration::from_secs(60)));
         Some(socket)
+    }
+
+    fn random(&mut self) -> [u8; 64] {
+        let mut rng = self.rng.borrow_mut();
+        let mut bytes = [0; 64];
+        for chunk in bytes.chunks_mut(8) {
+            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+        }
+        bytes
     }
 }
 
@@ -689,6 +712,7 @@ async fn follow<S: ChainStore>(
         mac,
         nonce,
         ntp_cookie,
+        rng,
         mut connected,
         mut watchdog,
     } = link;
@@ -711,11 +735,13 @@ async fn follow<S: ChainStore>(
         stack,
         rx: RX.init([0; 32 * 1024]),
         tx: TX.init([0; 8 * 1024]),
+        rng,
     };
     let mut peer_dialers: [TcpDialer; PEERS] = core::array::from_fn(|_| TcpDialer {
         stack,
         rx: alloc::vec![0; PEER_RX].leak(),
         tx: alloc::vec![0; PEER_TX].leak(),
+        rng,
     });
     let mut resolver = StackResolver(stack);
     let connections = async {

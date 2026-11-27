@@ -63,6 +63,10 @@ incremental = false
 lto = "fat"
 opt-level = "s"
 
+# the v2 transport's ciphers: syncing from a bridge in v2, a quarter of the core at "s", 6 % at 3
+[profile.release.package.chacha20-poly1305]
+opt-level = 3
+
 [patch.crates-io]
 # bitcoin_hashes 0.14.101 with the `sha256-extern` feature, and the bitcoin-io 0.1.101 beside it in
 # the same workspace (so that there is one `io::Write`): the `hashes-sha256-extern` branch of the

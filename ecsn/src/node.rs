@@ -57,6 +57,10 @@ pub struct Config {
     pub blocks_in_flight: usize,
     /// Whether peers are reached over IPv6 too (their addresses kept).
     pub ipv6: bool,
+    /// Whether the v2 transport (BIP 324) is tried with the ordinary peers that speak it.
+    pub v2: bool,
+    /// Whether it is tried with the bridge too, whose blocks then cost their decryption.
+    pub v2_bridge: bool,
 }
 
 /// Validated heights between two progress lines while syncing.
@@ -92,6 +96,8 @@ pub trait Dialer {
         Self: 'a;
     /// Opens a TCP connection to `addr`: `None` if it fails, within a few seconds.
     async fn connect(&mut self, addr: SocketAddr) -> Option<Self::Io<'_>>;
+    /// 64 random bytes, for the keys of a v2 connection.
+    fn random(&mut self) -> [u8; 64];
 }
 
 /// Resolves the DNS seeds.
@@ -224,6 +230,8 @@ pub struct PeerStatus {
     pub addr: Option<SocketAddr>,
     /// Its `version` message, once the handshake is done.
     pub info: Option<PeerInfo>,
+    /// Whether the connection is in the v2 transport.
+    pub v2: bool,
 }
 
 /// What the node is doing and what it did since it started, for a display.
@@ -371,12 +379,20 @@ impl<S: ChainStore> Node<S> {
                 role,
                 addr,
                 info: None,
+                v2: false,
             },
         );
     }
 
-    /// The handshake of the connection in `slot` is done.
-    fn slot_ready(&self, slot: usize, role: Role, addr: Option<SocketAddr>, version: &Version) {
+    /// The handshake of the connection in `slot` is done, in the v2 transport or not.
+    fn slot_ready(
+        &self,
+        slot: usize,
+        role: Role,
+        addr: Option<SocketAddr>,
+        version: &Version,
+        v2: bool,
+    ) {
         if self
             .status
             .borrow()
@@ -391,6 +407,7 @@ impl<S: ChainStore> Node<S> {
         }
         let mut status = self.status.borrow_mut();
         if let Some(peer) = status.peers.iter_mut().find(|p| p.slot == slot) {
+            peer.v2 = v2;
             peer.info = Some(PeerInfo {
                 user_agent: version.user_agent.clone(),
                 version: version.version,
@@ -749,13 +766,14 @@ impl<S: ChainStore> Node<S> {
     ) -> Result<(), Error<T::Error>> {
         self.set_phase(Phase::Handshake);
         let version = self.handshake(conn, now).await?;
-        self.slot_ready(slot, Role::Bridge, addr, &version);
+        self.slot_ready(slot, Role::Bridge, addr, &version, conn.is_v2());
         info!(
-            "bridge {}: {} height {} services {:#x}",
+            "bridge {}: {} height {} services {:#x}{}",
             Show(addr),
             version.user_agent,
             version.start_height,
-            version.services
+            version.services,
+            if conn.is_v2() { ", v2" } else { "" }
         );
         if version.services & services::UTREEXO_ARCHIVE == 0 {
             if !addr.is_none_or(|a| self.configured(a)) {
@@ -799,13 +817,14 @@ impl<S: ChainStore> Node<S> {
         now: i64,
     ) -> Result<(), Error<T::Error>> {
         let version = self.handshake(conn, now).await?;
-        self.slot_ready(slot, Role::Peer, addr, &version);
+        self.slot_ready(slot, Role::Peer, addr, &version, conn.is_v2());
         info!(
-            "peer {}: {} height {} services {:#x}",
+            "peer {}: {} height {} services {:#x}{}",
             Show(addr),
             version.user_agent,
             version.start_height,
-            version.services
+            version.services,
+            if conn.is_v2() { ", v2" } else { "" }
         );
         conn.send(&Message::Other {
             command: *b"sendheaders\0",
@@ -984,54 +1003,73 @@ impl<S: ChainStore> Node<S> {
             self.slot_open(slot, role, Some(addr));
             debug!("{name} {addr}: connecting");
             let opened = clock.now();
-            let outcome = match dialer.connect(addr).await {
-                None => {
+            // in v2 with a peer that speaks it, in v1 again at once if its v2 handshake fails
+            let outcome = loop {
+                let v2 = self.config.v2
+                    && (role == Role::Peer || self.config.v2_bridge)
+                    && self.book.borrow().wants_v2(addr);
+                let random = v2.then(|| dialer.random());
+                let Some(io) = dialer.connect(addr).await else {
                     debug!("{name} {addr}: not reached");
-                    Outcome::Unreached
-                }
-                Some(io) => {
-                    let mut conn = Connection::new(io, self.config.network);
-                    let now = clock.unix();
-                    let run = async {
-                        match role {
-                            Role::Bridge => self.run_bridge(&mut conn, slot, Some(addr), now).await,
-                            Role::Peer => self.run_peer(&mut conn, slot, Some(addr), now).await,
-                        }
-                    };
-                    let handshake = async {
-                        clock.sleep(HANDSHAKE_TIMEOUT).await;
-                        if self.slot_ready_now(slot) {
-                            pending::<()>().await;
-                        }
-                    };
-                    match select(run, handshake).await {
-                        Either::First(result) => {
-                            let ready = self.slot_ready_now(slot);
-                            let e = match result {
-                                Ok(()) => unreachable!("a connection returns only on an error"),
-                                Err(e) => e,
-                            };
-                            let short = clock.now() - opened < SHORT_LIVED;
-                            let outcome = match (ready, e.outcome()) {
-                                (_, Outcome::Misbehaved) => Outcome::Misbehaved,
-                                (false, _) => Outcome::Unreached,
-                                // a peer that hangs up at once waits longer each time
-                                (true, Outcome::Ended) if short => Outcome::Unreached,
-                                (true, outcome) => outcome,
-                            };
-                            match outcome {
-                                Outcome::Misbehaved => warn!("{name} {addr}: {e:?}, banned"),
-                                Outcome::WrongRole => debug!("{name} {addr}: not a bridge"),
-                                _ => info!("{name} {addr}: {e:?}"),
-                            }
-                            outcome
-                        }
-                        Either::Second(()) => {
-                            debug!("{name} {addr}: no handshake in {HANDSHAKE_TIMEOUT} s");
-                            Outcome::Unreached
-                        }
+                    break Outcome::Unreached;
+                };
+                let mut conn = Connection::new(io, self.config.network);
+                let now = clock.unix();
+                let keyed = Cell::new(false);
+                let run = async {
+                    if let Some(random) = random {
+                        conn.start_v2(bip324::Role::Initiator, random)
+                            .await
+                            .map_err(Error::P2p)?;
                     }
+                    keyed.set(true);
+                    match role {
+                        Role::Bridge => self.run_bridge(&mut conn, slot, Some(addr), now).await,
+                        Role::Peer => self.run_peer(&mut conn, slot, Some(addr), now).await,
+                    }
+                };
+                let handshake = async {
+                    clock.sleep(HANDSHAKE_TIMEOUT).await;
+                    if self.slot_ready_now(slot) {
+                        pending::<()>().await;
+                    }
+                };
+                let result = select(run, handshake).await;
+                if v2 && !keyed.get() {
+                    match &result {
+                        Either::First(Err(e)) => debug!("{name} {addr}: no v2 ({e:?}), v1"),
+                        _ => debug!("{name} {addr}: no v2 handshake in {HANDSHAKE_TIMEOUT} s, v1"),
+                    }
+                    self.book.borrow_mut().v1_only(addr);
+                    continue;
                 }
+                break match result {
+                    Either::First(result) => {
+                        let ready = self.slot_ready_now(slot);
+                        let e = match result {
+                            Ok(()) => unreachable!("a connection returns only on an error"),
+                            Err(e) => e,
+                        };
+                        let short = clock.now() - opened < SHORT_LIVED;
+                        let outcome = match (ready, e.outcome()) {
+                            (_, Outcome::Misbehaved) => Outcome::Misbehaved,
+                            (false, _) => Outcome::Unreached,
+                            // a peer that hangs up at once waits longer each time
+                            (true, Outcome::Ended) if short => Outcome::Unreached,
+                            (true, outcome) => outcome,
+                        };
+                        match outcome {
+                            Outcome::Misbehaved => warn!("{name} {addr}: {e:?}, banned"),
+                            Outcome::WrongRole => debug!("{name} {addr}: not a bridge"),
+                            _ => info!("{name} {addr}: {e:?}"),
+                        }
+                        outcome
+                    }
+                    Either::Second(()) => {
+                        debug!("{name} {addr}: no handshake in {HANDSHAKE_TIMEOUT} s");
+                        Outcome::Unreached
+                    }
+                };
             };
             self.slot_closed(slot);
             self.book.borrow_mut().release(addr, outcome, clock.now());

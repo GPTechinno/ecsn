@@ -99,6 +99,8 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
         assume_utreexo: None,
         blocks_in_flight,
         ipv6: false,
+        v2: true,
+        v2_bridge: true,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -233,6 +235,8 @@ fn a_block_announced_during_a_sync_is_followed() {
         assume_utreexo: None,
         blocks_in_flight: 8,
         ipv6: false,
+        v2: true,
+        v2_bridge: true,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -313,6 +317,8 @@ fn a_reset_during_the_header_sync_keeps_the_headers_synced() {
         assume_utreexo: None,
         blocks_in_flight: 1,
         ipv6: false,
+        v2: true,
+        v2_bridge: true,
     };
     let node = Node::new(store, config(), 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -395,6 +401,8 @@ fn the_next_batch_of_headers_is_asked_for_before_checking_one() {
         assume_utreexo: None,
         blocks_in_flight: 1,
         ipv6: false,
+        v2: true,
+        v2_bridge: true,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()

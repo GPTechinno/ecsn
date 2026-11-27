@@ -22,6 +22,8 @@ floresta-chain = { git = "https://github.com/GPTechinno/Floresta", branch = "per
 rustreexo = { version = "=0.7.0", default-features = false }
 embedded-io-async = "0.7"
 embassy-futures = "0.1"
+# BIP 324, the v2 transport, without std
+bip324 = { version = "0.11", default-features = false }
 tracing = { version = "0.1", default-features = false }
 
 ecsn = { path = "ecsn" }

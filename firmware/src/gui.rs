@@ -483,9 +483,10 @@ fn node(p: &mut Flex<'_>, d: &Dashboard) {
         let ip = peer
             .addr
             .map_or_else(|| String::from("?"), |a| format!("{}", a.ip()));
+        let v2 = if peer.v2 { " v2" } else { "" };
         let what = match (&peer.info, peer.role) {
-            (Some(info), Role::Bridge) => format!("bridge, {}", agent(&info.user_agent)),
-            (Some(info), Role::Peer) => String::from(agent(&info.user_agent)),
+            (Some(info), Role::Bridge) => format!("bridge, {}{v2}", agent(&info.user_agent)),
+            (Some(info), Role::Peer) => format!("{}{v2}", agent(&info.user_agent)),
             (None, Role::Bridge) => String::from("bridge, connecting"),
             (None, Role::Peer) => String::from("connecting"),
         };

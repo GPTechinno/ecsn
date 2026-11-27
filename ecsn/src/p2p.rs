@@ -1,12 +1,17 @@
 //! The Bitcoin P2P messages the node uses (protocol version 70016, BIP 144 witness blocks), with
-//! BIP 183's Utreexo proof messages and BIP 155's `addrv2`, and their framing over a byte stream
-//! (the v1 transport: magic, command, length, checksum).
+//! BIP 183's Utreexo proof messages and BIP 155's `addrv2`, and their framing over a byte stream:
+//! the v1 transport (magic, command, length, checksum), or BIP 324's v2 (a key exchange, then
+//! encrypted packets, the commonest commands as one byte).
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use bip324::{
+    FillBytes, GarbageResult, Handshake, InboundCipher, Initialized, OutboundCipher, PacketType,
+    ReceivedKey, Role, VersionResult,
+};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{self, serialize, Decodable, Encodable, VarInt};
 use bitcoin::hashes::{sha256d, Hash};
@@ -55,6 +60,8 @@ pub mod services {
     pub const WITNESS: u64 = 1 << 3;
     /// Serves the last 288 blocks (BIP 159).
     pub const NETWORK_LIMITED: u64 = 1 << 10;
+    /// Speaks the v2 transport (BIP 324).
+    pub const P2P_V2: u64 = 1 << 11;
     /// Serves Utreexo proofs of new blocks and transactions (BIP 183).
     pub const UTREEXO: u64 = 1 << 12;
     /// Serves Utreexo proofs of every past block (BIP 183).
@@ -604,6 +611,71 @@ fn get_bytes(r: &mut &[u8], max: usize) -> Result<Vec<u8>, encode::Error> {
     Ok(bytes.to_vec())
 }
 
+/// The commands BIP 324 sends as one byte, from 1.
+const V2_COMMANDS: [&str; 28] = [
+    "addr",
+    "block",
+    "blocktxn",
+    "cmpctblock",
+    "feefilter",
+    "filteradd",
+    "filterclear",
+    "filterload",
+    "getblocks",
+    "getblocktxn",
+    "getdata",
+    "getheaders",
+    "headers",
+    "inv",
+    "mempool",
+    "merkleblock",
+    "notfound",
+    "ping",
+    "pong",
+    "sendcmpct",
+    "tx",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "addrv2",
+];
+
+/// The one-byte IDs Utreexo nodes give BIP 183's messages in the v2 transport, after BIP 324's.
+const V2_UTREEXO: [(u8, &str); 2] = [(29, "uproof"), (30, "getuproof")];
+
+/// The one-byte ID of `name` in the v2 transport, if it has one.
+fn v2_id(name: &[u8; 12]) -> Option<u8> {
+    V2_COMMANDS
+        .iter()
+        .position(|c| command(c) == *name)
+        .map(|i| i as u8 + 1)
+        .or_else(|| {
+            V2_UTREEXO
+                .iter()
+                .find(|(_, c)| command(c) == *name)
+                .map(|(id, _)| *id)
+        })
+}
+
+/// The command of a one-byte ID of the v2 transport, if known.
+fn v2_command(id: u8) -> Option<[u8; 12]> {
+    let known = match id {
+        1..=28 => Some(V2_COMMANDS[id as usize - 1]),
+        _ => V2_UTREEXO.iter().find(|(i, _)| *i == id).map(|(_, c)| *c),
+    };
+    known.map(command)
+}
+
+/// The most garbage a v2 peer may send before its terminator.
+const MAX_GARBAGE: usize = 4095;
+/// The longest packet taken during the v2 handshake (decoys and the version packet).
+const MAX_HANDSHAKE_PACKET: usize = 4096;
+/// A v2 packet's bytes beside its contents: length, header byte, tag.
+const V2_OVERHEAD: usize = 3 + 1 + 16;
+
 /// What can go wrong on a connection.
 #[derive(Debug)]
 pub enum Error<E> {
@@ -611,6 +683,8 @@ pub enum Error<E> {
     Io(E),
     /// The peer closed the stream.
     Closed,
+    /// The v2 transport: a handshake or a packet that does not check out.
+    V2(bip324::Error),
     /// A message of another network.
     WrongNetwork([u8; 4]),
     /// A payload above [`MAX_PAYLOAD`].
@@ -624,11 +698,48 @@ pub enum Error<E> {
     },
 }
 
-/// A connection to a peer over a byte stream, in the v1 transport.
+/// Random bytes given beforehand, 32 at a time.
+struct Given([u8; 64], usize);
+
+impl FillBytes for Given {
+    fn fill_bytes(&mut self, dest: &mut [u8; 32]) {
+        let at = self.1 % 2 * 32;
+        dest.copy_from_slice(&self.0[at..at + 32]);
+        self.1 += 1;
+    }
+}
+
+/// The ciphers of a v2 connection.
+struct V2 {
+    inbound: InboundCipher,
+    outbound: OutboundCipher,
+}
+
+/// Bytes from `io`, those of `ahead` first: 0 when it closed. Cancel-safe when `io`'s `read` is.
+async fn read_ahead<T: Read>(
+    ahead: &mut Vec<u8>,
+    io: &mut T,
+    buf: &mut [u8],
+) -> Result<usize, Error<T::Error>> {
+    if !ahead.is_empty() {
+        let n = buf.len().min(ahead.len());
+        buf[..n].copy_from_slice(&ahead[..n]);
+        ahead.drain(..n);
+        return Ok(n);
+    }
+    io.read(buf).await.map_err(Error::Io)
+}
+
+/// A connection to a peer over a byte stream: in the v1 transport, or in the v2 once
+/// [`Connection::start_v2`] did its handshake.
 pub struct Connection<T> {
     io: T,
     magic: [u8; 4],
-    /// The message being received, as far as read: its header, then its payload.
+    v2: Option<V2>,
+    /// Bytes read ahead during the v2 handshake, taken before the stream's.
+    ahead: Vec<u8>,
+    /// The message being received, as far as read: its header (24 bytes in v1, the 3 bytes of
+    /// the encrypted length in v2), then its payload (the packet in v2).
     head: [u8; 24],
     head_read: usize,
     payload: Vec<u8>,
@@ -636,10 +747,13 @@ pub struct Connection<T> {
 }
 
 impl<T: Read + Write> Connection<T> {
+    /// A connection in the v1 transport.
     pub fn new(io: T, network: Network) -> Self {
         Self {
             io,
             magic: network.magic().to_bytes(),
+            v2: None,
+            ahead: Vec::new(),
             head: [0; 24],
             head_read: 0,
             payload: Vec::new(),
@@ -647,9 +761,115 @@ impl<T: Read + Write> Connection<T> {
         }
     }
 
+    /// Whether the connection is in the v2 transport.
+    pub fn is_v2(&self) -> bool {
+        self.v2.is_some()
+    }
+
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error<T::Error>> {
+        let mut done = 0;
+        while done < buf.len() {
+            match read_ahead(&mut self.ahead, &mut self.io, &mut buf[done..]).await? {
+                0 => return Err(Error::Closed),
+                n => done += n,
+            }
+        }
+        Ok(())
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), Error<T::Error>> {
+        self.io.write_all(bytes).await.map_err(Error::Io)?;
+        self.io.flush().await.map_err(Error::Io)
+    }
+
+    /// The v2 handshake (BIP 324) as `role`, with no garbage nor decoys of ours: the keys, then
+    /// each side's version packet; every message after it is encrypted. `random`: 64 random
+    /// bytes, the secret key and the randomness of its encoding. A v1 peer closes the connection
+    /// at our key, or sends its `version` (`Error::V2(V1Protocol)`).
+    pub async fn start_v2(&mut self, role: Role, random: [u8; 64]) -> Result<(), Error<T::Error>> {
+        let curve = secp256k1::Secp256k1::verification_only();
+        let mut random = Given(random, 0);
+        let handshake =
+            Handshake::<Initialized>::new_with_rng(self.magic, role, &mut random, &curve)
+                .map_err(Error::V2)?;
+        let mut key = [0; 64];
+        let handshake = handshake.send_key(None, &mut key).map_err(Error::V2)?;
+        self.write(&key).await?;
+        let mut theirs = [0; 64];
+        self.read_exact(&mut theirs).await?;
+        let handshake = handshake.receive_key(theirs).map_err(Error::V2)?;
+        let mut out = vec![0; Handshake::<ReceivedKey>::send_version_len(None)];
+        let handshake = handshake.send_version(&mut out, None).map_err(Error::V2)?;
+        self.write(&out).await?;
+
+        // their garbage up to its terminator
+        let mut garbage = vec![0; 16];
+        self.read_exact(&mut garbage).await?;
+        let mut waiting = handshake;
+        let (mut handshake, used) = loop {
+            match waiting.receive_garbage(&garbage).map_err(Error::V2)? {
+                GarbageResult::FoundGarbage {
+                    handshake,
+                    consumed_bytes,
+                } => break (handshake, consumed_bytes),
+                GarbageResult::NeedMoreData(h) => {
+                    waiting = h;
+                    if garbage.len() > MAX_GARBAGE + 16 {
+                        return Err(Error::V2(bip324::Error::NoGarbageTerminator));
+                    }
+                    let mut more = [0; 256];
+                    match read_ahead(&mut self.ahead, &mut self.io, &mut more).await? {
+                        0 => return Err(Error::Closed),
+                        n => garbage.extend_from_slice(&more[..n]),
+                    }
+                }
+            }
+        };
+        // what came after the terminator is read before the stream
+        let mut rest = garbage[used..].to_vec();
+        rest.extend_from_slice(&self.ahead);
+        self.ahead = rest;
+        // their decoys, then their version packet
+        loop {
+            let mut length = [0; 3];
+            self.read_exact(&mut length).await?;
+            let len = handshake.decrypt_packet_len(length).map_err(Error::V2)?;
+            if len > MAX_HANDSHAKE_PACKET {
+                return Err(Error::V2(bip324::Error::PacketTooBig));
+            }
+            let mut packet = vec![0; len];
+            self.read_exact(&mut packet).await?;
+            match handshake.receive_version(&mut packet).map_err(Error::V2)? {
+                VersionResult::Complete { cipher } => {
+                    let (inbound, outbound) = cipher.into_split();
+                    self.v2 = Some(V2 { inbound, outbound });
+                    return Ok(());
+                }
+                VersionResult::Decoy(h) => handshake = h,
+            }
+        }
+    }
+
     /// Sends a message.
     pub async fn send(&mut self, message: &Message) -> Result<(), Error<T::Error>> {
         let payload = message.encode();
+        if let Some(v2) = &mut self.v2 {
+            let name = message.command();
+            let mut contents = Vec::with_capacity(13 + payload.len());
+            match v2_id(&name) {
+                Some(id) => contents.push(id),
+                None => {
+                    contents.push(0);
+                    contents.extend_from_slice(&name);
+                }
+            }
+            contents.extend_from_slice(&payload);
+            let mut packet = vec![0; contents.len() + V2_OVERHEAD];
+            v2.outbound
+                .encrypt(&contents, &mut packet, PacketType::Genuine, None)
+                .map_err(Error::V2)?;
+            return self.write(&packet).await;
+        }
         let mut head = [0; 24];
         head[..4].copy_from_slice(&self.magic);
         head[4..16].copy_from_slice(&message.command());
@@ -663,12 +883,16 @@ impl<T: Read + Write> Connection<T> {
     /// Receives the next message. Cancel-safe when the stream's `read` is: a call dropped before
     /// it returns keeps what it read, and the next call goes on from there.
     pub async fn recv(&mut self) -> Result<Message, Error<T::Error>> {
+        if self.v2.is_some() {
+            return self.recv_v2().await;
+        }
         while self.head_read < self.head.len() {
-            let n = self
-                .io
-                .read(&mut self.head[self.head_read..])
-                .await
-                .map_err(Error::Io)?;
+            let n = read_ahead(
+                &mut self.ahead,
+                &mut self.io,
+                &mut self.head[self.head_read..],
+            )
+            .await?;
             if n == 0 {
                 return Err(Error::Closed);
             }
@@ -689,17 +913,7 @@ impl<T: Read + Write> Connection<T> {
                 self.payload_read = 0;
             }
         }
-        while self.payload_read < self.payload.len() {
-            let n = self
-                .io
-                .read(&mut self.payload[self.payload_read..])
-                .await
-                .map_err(Error::Io)?;
-            if n == 0 {
-                return Err(Error::Closed);
-            }
-            self.payload_read += n;
-        }
+        self.read_payload().await?;
         // the whole message is here: the next call starts another
         self.head_read = 0;
         let payload = core::mem::take(&mut self.payload);
@@ -709,6 +923,81 @@ impl<T: Read + Write> Connection<T> {
         let mut command = [0; 12];
         command.copy_from_slice(&self.head[4..16]);
         Message::decode(&command, &payload).map_err(|error| Error::Decode { command, error })
+    }
+
+    /// Reads the rest of the payload being received.
+    async fn read_payload(&mut self) -> Result<(), Error<T::Error>> {
+        while self.payload_read < self.payload.len() {
+            let n = read_ahead(
+                &mut self.ahead,
+                &mut self.io,
+                &mut self.payload[self.payload_read..],
+            )
+            .await?;
+            if n == 0 {
+                return Err(Error::Closed);
+            }
+            self.payload_read += n;
+        }
+        Ok(())
+    }
+
+    /// [`Connection::recv`] in the v2 transport: the encrypted length, then the packet; decoys
+    /// and commands of unknown one-byte IDs skipped.
+    async fn recv_v2(&mut self) -> Result<Message, Error<T::Error>> {
+        loop {
+            while self.head_read < 3 {
+                let n = read_ahead(
+                    &mut self.ahead,
+                    &mut self.io,
+                    &mut self.head[self.head_read..3],
+                )
+                .await?;
+                if n == 0 {
+                    return Err(Error::Closed);
+                }
+                self.head_read += n;
+                if self.head_read == 3 {
+                    let v2 = self.v2.as_mut().expect("a v2 connection");
+                    let length = [self.head[0], self.head[1], self.head[2]];
+                    let len = v2.inbound.decrypt_packet_len(length);
+                    if len > MAX_PAYLOAD + 13 + V2_OVERHEAD {
+                        return Err(Error::Oversized(len as u32));
+                    }
+                    self.payload = vec![0; len];
+                    self.payload_read = 0;
+                }
+            }
+            self.read_payload().await?;
+            self.head_read = 0;
+            let mut packet = core::mem::take(&mut self.payload);
+            let v2 = self.v2.as_mut().expect("a v2 connection");
+            let (kind, plain) = v2
+                .inbound
+                .decrypt_in_place(&mut packet, None)
+                .map_err(Error::V2)?;
+            if kind == PacketType::Decoy {
+                continue;
+            }
+            // the header byte, then the command, then the payload
+            let contents = &plain[1..];
+            let (name, payload) = match contents.first() {
+                Some(0) if contents.len() >= 13 => {
+                    let mut name = [0; 12];
+                    name.copy_from_slice(&contents[1..13]);
+                    (name, &contents[13..])
+                }
+                Some(0) | None => return Err(Error::V2(bip324::Error::CiphertextTooSmall)),
+                Some(&id) => match v2_command(id) {
+                    Some(name) => (name, &contents[1..]),
+                    None => continue,
+                },
+            };
+            return Message::decode(&name, payload).map_err(|error| Error::Decode {
+                command: name,
+                error,
+            });
+        }
     }
 }
 
@@ -931,6 +1220,167 @@ mod tests {
         assert!(tokio::time::timeout(wait, conn.recv()).await.is_err());
         theirs.write_all(&frame[28..]).await.unwrap();
         assert!(matches!(conn.recv().await.unwrap(), Message::Ping(7)));
+    }
+
+    /// 64 bytes random enough for tests: SplitMix64 from `seed`.
+    fn random(mut seed: u64) -> [u8; 64] {
+        let mut out = [0; 64];
+        for chunk in out.chunks_mut(8) {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            chunk.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        out
+    }
+
+    type Io = embedded_io_adapters::tokio_1::FromTokio<tokio::io::DuplexStream>;
+
+    /// Two connections in the v2 transport over a stream of `buffer` bytes.
+    async fn v2_pair(buffer: usize) -> (Connection<Io>, Connection<Io>) {
+        use embedded_io_adapters::tokio_1::FromTokio;
+        let (a, b) = tokio::io::duplex(buffer);
+        let mut a = Connection::new(FromTokio::new(a), Network::Signet);
+        let mut b = Connection::new(FromTokio::new(b), Network::Signet);
+        let (ra, rb) = tokio::join!(
+            a.start_v2(Role::Initiator, random(1)),
+            b.start_v2(Role::Responder, random(2))
+        );
+        ra.unwrap();
+        rb.unwrap();
+        assert!(a.is_v2() && b.is_v2());
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn v2_carries_messages_of_one_byte_ids_and_long_commands() {
+        let (mut a, mut b) = v2_pair(1 << 16).await;
+        let genesis = bitcoin::constants::genesis_block(Network::Signet);
+        let hash = genesis.block_hash();
+        let messages = vec![
+            Message::Verack,
+            Message::Ping(42),
+            Message::Headers(vec![genesis.header]),
+            Message::GetUtreexoProof(GetUtreexoProof::all(hash)),
+            Message::SendAddrV2,
+        ];
+        for m in &messages {
+            a.send(m).await.unwrap();
+        }
+        for m in &messages {
+            let got = b.recv().await.unwrap();
+            assert_eq!(got.command(), m.command());
+            assert_eq!(got.encode(), m.encode());
+        }
+        // and back
+        b.send(&Message::Pong(42)).await.unwrap();
+        assert!(matches!(a.recv().await.unwrap(), Message::Pong(42)));
+    }
+
+    #[test]
+    fn the_commonest_commands_take_one_byte() {
+        assert_eq!(v2_id(&command("addr")), Some(1));
+        assert_eq!(v2_id(&command("block")), Some(2));
+        assert_eq!(v2_id(&command("headers")), Some(13));
+        assert_eq!(v2_id(&command("addrv2")), Some(28));
+        assert_eq!(v2_id(&command("version")), None);
+        assert_eq!(v2_id(&command("uproof")), Some(29));
+        assert_eq!(v2_id(&command("getuproof")), Some(30));
+        assert_eq!(v2_command(29), Some(command("uproof")));
+        assert_eq!(v2_command(31), None);
+    }
+
+    /// Two streams joined by a relay that passes 4 kB every 2 ms one way, at once the other.
+    fn slow_link() -> (Io, Io, impl core::future::Future<Output = ()>) {
+        use embedded_io_adapters::tokio_1::FromTokio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a, a_far) = tokio::io::duplex(1 << 20);
+        let (b, b_far) = tokio::io::duplex(1 << 20);
+        let relay = async move {
+            let (mut ar, mut aw) = tokio::io::split(a_far);
+            let (mut br, mut bw) = tokio::io::split(b_far);
+            let forward = async {
+                let mut buf = [0; 4096];
+                while let Ok(n @ 1..) = ar.read(&mut buf).await {
+                    if bw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            };
+            let back = async {
+                let _ = tokio::io::copy(&mut br, &mut aw).await;
+            };
+            tokio::join!(forward, back);
+        };
+        (FromTokio::new(a), FromTokio::new(b), relay)
+    }
+
+    /// Sends a 162 kB `headers` from `a` while `b`'s receive is dropped every millisecond.
+    async fn interrupted(a: &mut Connection<Io>, b: &mut Connection<Io>) {
+        let genesis = bitcoin::constants::genesis_block(Network::Signet).header;
+        let big = Message::Headers(vec![genesis; MAX_HEADERS]);
+        let send = async { a.send(&big).await.unwrap() };
+        let receive = async {
+            let mut drops = 0;
+            loop {
+                let wait = std::time::Duration::from_millis(1);
+                match tokio::time::timeout(wait, b.recv()).await {
+                    Ok(m) => break (m.unwrap(), drops),
+                    Err(_) => drops += 1,
+                }
+            }
+        };
+        let ((), (got, drops)) = tokio::join!(send, receive);
+        assert_eq!(got.encode(), big.encode());
+        assert!(drops > 10, "{drops} drops");
+    }
+
+    #[tokio::test]
+    async fn a_large_message_survives_receives_dropped_halfway_in_v1() {
+        let (a, b, relay) = slow_link();
+        let mut a = Connection::new(a, Network::Signet);
+        let mut b = Connection::new(b, Network::Signet);
+        tokio::select! {
+            () = relay => panic!("the relay stopped"),
+            () = interrupted(&mut a, &mut b) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_message_survives_receives_dropped_halfway_in_v2() {
+        let (a, b, relay) = slow_link();
+        let mut a = Connection::new(a, Network::Signet);
+        let mut b = Connection::new(b, Network::Signet);
+        let test = async {
+            let (ra, rb) = tokio::join!(
+                a.start_v2(Role::Initiator, random(4)),
+                b.start_v2(Role::Responder, random(5))
+            );
+            ra.unwrap();
+            rb.unwrap();
+            interrupted(&mut a, &mut b).await;
+        };
+        tokio::select! {
+            () = relay => panic!("the relay stopped"),
+            () = test => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_v1_peer_ends_the_v2_handshake() {
+        use embedded_io_adapters::tokio_1::FromTokio;
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let mut ours = Connection::new(FromTokio::new(a), Network::Signet);
+        let theirs = async move {
+            // a v1 peer: our key is not a message of its network, it hangs up
+            let mut v1 = Connection::new(FromTokio::new(b), Network::Signet);
+            assert!(matches!(v1.recv().await, Err(Error::WrongNetwork(_))));
+        };
+        let (result, ()) = tokio::join!(ours.start_v2(Role::Initiator, random(3)), theirs);
+        assert!(matches!(result, Err(Error::Closed)), "{result:?}");
+        assert!(!ours.is_v2());
     }
 
     #[test]

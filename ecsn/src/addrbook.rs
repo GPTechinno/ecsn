@@ -54,6 +54,8 @@ pub struct Entry {
     pub handshakes: u32,
     /// Tries in a row that failed.
     pub failures: u32,
+    /// Its v2 handshake failed: v1 only.
+    pub v1_only: bool,
     /// Not tried again before this time.
     retry_at: u64,
     /// A connection to it is open, or being opened.
@@ -122,10 +124,28 @@ impl AddrBook {
             source,
             handshakes: 0,
             failures: 0,
+            v1_only: false,
             retry_at: 0,
             in_use: false,
         });
         true
+    }
+
+    /// Whether to try the v2 transport with `addr`: it says it speaks it, or it is the configured
+    /// peer (its services unknown before its handshake), and it has not failed at it.
+    pub fn wants_v2(&self, addr: SocketAddr) -> bool {
+        self.entries.iter().any(|e| {
+            e.addr == addr
+                && (e.services & services::P2P_V2 != 0 || e.source == Source::Configured)
+                && !e.v1_only
+        })
+    }
+
+    /// The v2 handshake with `addr` failed: v1 from now on.
+    pub fn v1_only(&mut self, addr: SocketAddr) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.addr == addr) {
+            e.v1_only = true;
+        }
     }
 
     /// Drops an address to make room: one never reached if any, else another, at random; never
@@ -480,6 +500,26 @@ mod tests {
         // an `addr` saying otherwise changes nothing once it did its handshake
         book.add(a, BRIDGE, Source::Peer);
         assert_eq!(book.pick(Role::Peer, 0), Some(a));
+    }
+
+    #[test]
+    fn v2_is_tried_with_those_that_speak_it_until_it_fails() {
+        let mut book = AddrBook::new(false, 1);
+        let a = addr("1.2.3.4:8333");
+        let b = addr("5.6.7.8:8333");
+        book.add(a, FULL | services::P2P_V2, Source::Peer);
+        book.add(b, FULL, Source::Peer);
+        assert!(book.wants_v2(a));
+        assert!(!book.wants_v2(b));
+        book.v1_only(a);
+        assert!(!book.wants_v2(a));
+        // its handshake says v2: v1 still, it failed
+        book.handshake(a, FULL | services::P2P_V2);
+        assert!(!book.wants_v2(a));
+        // the configured peer: v2 first
+        let c = addr("1.231.31.3:8333");
+        book.add(c, 0, Source::Configured);
+        assert!(book.wants_v2(c));
     }
 
     #[test]

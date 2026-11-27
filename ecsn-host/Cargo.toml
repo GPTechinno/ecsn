@@ -19,3 +19,4 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
+bip324 = { workspace = true }

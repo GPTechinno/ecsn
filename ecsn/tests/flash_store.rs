@@ -24,6 +24,8 @@ fn config() -> Config {
         assume_utreexo: None,
         blocks_in_flight: 1,
         ipv6: false,
+        v2: true,
+        v2_bridge: true,
     }
 }
 
