@@ -1,5 +1,9 @@
-//! Runs the ECSN node against one peer over TCP. Logs go to stderr (`RUST_LOG`, `info` by
-//! default); at the end the validated tip and its accumulator go to stdout.
+//! Runs the ECSN node over TCP. Logs go to stderr (`RUST_LOG`, `info` by default).
+//!
+//! Without `--follow` it syncs from one peer and exits, the validated tip and its accumulator on
+//! stdout. With `--follow` it keeps following the chain: the peer is the bridge tried first, others
+//! come from the DNS seeds and the peers' addresses, and `--peers` ordinary peers announce the new
+//! blocks; the connections are logged every minute.
 //!
 //! The chain is kept in RAM, or with `--store` on the flash chain store, in a file holding a
 //! flash image.
@@ -12,18 +16,20 @@ mod heap;
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::Network;
 use clap::Parser;
-use ecsn::node::{Config, Node};
-use ecsn::p2p::Connection;
+use ecsn::node::{Clock, Config, Dialer, Node, Resolver, Role, Source};
+use ecsn::p2p::{default_port, Connection};
 use ecsn::store::{FlashChainStore, MemChainStore};
 use embedded_io_adapters::tokio_1::FromTokio;
 use file_flash::FileFlash;
 use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
+use futures::future::join_all;
 use tokio::net::TcpStream;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -42,9 +48,15 @@ struct Args {
     /// Start from floresta-chain's accumulator of the network
     #[arg(long)]
     assume_utreexo: bool,
-    /// Keep following the peer's new blocks after the sync
+    /// Keep following the chain after the sync: the peer is then the bridge tried first
     #[arg(long)]
     follow: bool,
+    /// Ordinary peers to keep connected with `--follow`, for new blocks and addresses
+    #[arg(long, default_value_t = 2)]
+    peers: usize,
+    /// Reach peers over IPv6 too
+    #[arg(long)]
+    ipv6: bool,
     /// Keep the chain in this flash image (created, and formatted, if needed) instead of in RAM
     #[arg(long)]
     store: Option<PathBuf>,
@@ -59,14 +71,54 @@ struct Args {
     heap_limit: Option<usize>,
 }
 
-fn default_port(network: Network) -> u16 {
-    match network {
-        Network::Bitcoin => 8333,
-        Network::Testnet => 18333,
-        Network::Testnet4 => 48333,
-        Network::Signet => 38333,
-        _ => 18444,
+/// TCP connections, given 10 s to open.
+struct TcpDialer;
+
+impl Dialer for TcpDialer {
+    type Io<'a> = FromTokio<TcpStream>;
+
+    async fn connect(&mut self, addr: SocketAddr) -> Option<Self::Io<'_>> {
+        let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+            .await
+            .ok()?
+            .ok()?;
+        let _ = stream.set_nodelay(true);
+        Some(FromTokio::new(stream))
     }
+}
+
+struct TokioClock(Instant);
+
+impl Clock for TokioClock {
+    fn now(&self) -> u64 {
+        self.0.elapsed().as_secs()
+    }
+
+    fn unix(&self) -> i64 {
+        unix_now()
+    }
+
+    async fn sleep(&self, seconds: u64) {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
+}
+
+/// The system's resolver.
+struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    async fn resolve(&mut self, name: &str) -> Vec<IpAddr> {
+        match tokio::net::lookup_host((name, 0)).await {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -103,6 +155,7 @@ async fn main() -> ExitCode {
             .assume_utreexo
             .then(|| ChainParams::get_assume_utreexo(args.network)),
         blocks_in_flight: args.blocks_in_flight,
+        ipv6: args.ipv6,
     };
 
     let Some(path) = &args.store else {
@@ -147,6 +200,10 @@ async fn run<S: ChainStore>(args: &Args, store: S, config: Config) -> ExitCode {
         }
     };
 
+    if args.follow {
+        return follow(args, &node, &peer).await;
+    }
+
     let stream = match TcpStream::connect(&peer).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -156,17 +213,9 @@ async fn run<S: ChainStore>(args: &Args, store: S, config: Config) -> ExitCode {
     };
     let _ = stream.set_nodelay(true);
     let mut conn = Connection::new(FromTokio::new(stream), args.network);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-
-    let result = if args.follow {
-        node.run(&mut conn, now).await
-    } else {
-        match node.handshake(&mut conn, now).await {
-            Ok(_) => node.sync(&mut conn).await.map(|_| ()),
-            Err(e) => Err(e),
-        }
+    let result = match node.handshake(&mut conn, unix_now()).await {
+        Ok(_) => node.sync(&mut conn).await.map(|_| ()),
+        Err(e) => Err(e),
     };
     if let Err(e) = result {
         eprintln!("{peer}: {e:?}");
@@ -182,5 +231,59 @@ async fn run<S: ChainStore>(args: &Args, store: S, config: Config) -> ExitCode {
     for root in &acc.roots {
         println!("root {root}");
     }
+    ExitCode::SUCCESS
+}
+
+/// Follows the chain until stopped: the bridge's slot (`peer` tried first), the ordinary peers'
+/// slots, the DNS seeds, and the connections logged every minute.
+async fn follow<S: ChainStore>(args: &Args, node: &Node<S>, peer: &str) -> ExitCode {
+    match tokio::net::lookup_host(peer).await {
+        Ok(addrs) => {
+            for addr in addrs.filter(|a| args.ipv6 || a.is_ipv4()) {
+                node.add_address(addr, 0, Source::Configured);
+            }
+        }
+        Err(e) => {
+            eprintln!("{peer}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let clock = TokioClock(Instant::now());
+    let mut dialers: Vec<TcpDialer> = (0..=args.peers).map(|_| TcpDialer).collect();
+    let slots = dialers.iter_mut().enumerate().map(|(slot, dialer)| {
+        let role = if slot == 0 { Role::Bridge } else { Role::Peer };
+        node.run_slot(slot, role, dialer, &clock)
+    });
+    let mut resolver = SystemResolver;
+    let report = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let status = node.status();
+            let chain = node.chain();
+            let validated = chain.get_validation_index().unwrap_or(0);
+            let best = chain.get_best_block().map_or(0, |(h, _)| h);
+            let mut line = format!(
+                "validated {validated} of {best}, {:?}; {} addresses ({} bridges);",
+                status.phase, status.known, status.known_bridges
+            );
+            for p in &status.peers {
+                let role = match p.role {
+                    Role::Bridge => "bridge",
+                    Role::Peer => "peer",
+                };
+                let addr = p.addr.map_or_else(|| "?".into(), |a| a.to_string());
+                match &p.info {
+                    Some(info) => line += &format!(" {role} {addr} {}", info.user_agent),
+                    None => line += &format!(" {role} {addr} (connecting)"),
+                }
+            }
+            info!("{line}");
+        }
+    };
+    tokio::join!(
+        join_all(slots),
+        node.discover(&mut resolver, &clock),
+        report
+    );
     ExitCode::SUCCESS
 }

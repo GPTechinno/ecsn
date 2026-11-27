@@ -98,6 +98,7 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
         user_agent: String::new(),
         assume_utreexo: None,
         blocks_in_flight,
+        ipv6: false,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -107,7 +108,11 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
         let (ours, theirs) = tokio::io::duplex(1 << 16);
         let ours = async {
             let mut conn = Connection::new(FromTokio::new(ours), Network::Regtest);
-            node.handshake(&mut conn, 0).await.unwrap();
+            let version = node.handshake(&mut conn, 0).await.unwrap();
+            assert_eq!(
+                (version.user_agent.as_str(), version.start_height),
+                ("/fixture/", 111)
+            );
             assert_eq!(node.sync(&mut conn).await.unwrap(), 111);
         };
         tokio::join!(ours, peer(theirs, &fixture, order)).1
@@ -120,8 +125,8 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
 
     let status = node.status();
     assert_eq!(status.phase, Phase::Following);
-    let peer = status.peer.unwrap();
-    assert_eq!((peer.user_agent.as_str(), peer.height), ("/fixture/", 111));
+    // a connection handed to the node, its handshake done by hand: no slot shows it
+    assert!(status.peers.is_empty());
     assert_eq!(status.connections, 1);
     assert_eq!(status.validated, 111);
     let last = status.last_block.unwrap();
@@ -227,6 +232,7 @@ fn a_block_announced_during_a_sync_is_followed() {
         user_agent: String::new(),
         assume_utreexo: None,
         blocks_in_flight: 8,
+        ipv6: false,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -238,7 +244,7 @@ fn a_block_announced_during_a_sync_is_followed() {
         let ours = async {
             let mut conn = Connection::new(FromTokio::new(ours), Network::Regtest);
             // the peer hangs up at the end
-            assert!(node.run(&mut conn, 0).await.is_err());
+            assert!(node.run_bridge(&mut conn, 0, None, 0).await.is_err());
         };
         let both = async { tokio::join!(ours, peer_with_a_late_block(theirs, &fixture)) };
         tokio::time::timeout(std::time::Duration::from_secs(10), both)
@@ -249,7 +255,12 @@ fn a_block_announced_during_a_sync_is_followed() {
     // the connection ended
     let status = node.status();
     assert_eq!(status.phase, Phase::Idle);
-    assert!(status.peer.is_none());
+    // the slot shows the bridge until whoever runs the slots closes it
+    let bridge = status.bridge().unwrap().info.as_ref().unwrap();
+    assert_eq!(
+        (bridge.user_agent.as_str(), bridge.height),
+        ("/fixture/", 110)
+    );
     assert_eq!(status.connections, 1);
     assert_eq!(status.last_block.map(|b| b.height), Some(111));
 }
@@ -301,6 +312,7 @@ fn a_reset_during_the_header_sync_keeps_the_headers_synced() {
         user_agent: String::new(),
         assume_utreexo: None,
         blocks_in_flight: 1,
+        ipv6: false,
     };
     let node = Node::new(store, config(), 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -382,6 +394,7 @@ fn the_next_batch_of_headers_is_asked_for_before_checking_one() {
         user_agent: String::new(),
         assume_utreexo: None,
         blocks_in_flight: 1,
+        ipv6: false,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()

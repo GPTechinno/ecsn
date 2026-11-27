@@ -28,6 +28,8 @@ embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "execu
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
 embassy-futures = "0.1"
+# up to 16 addresses from a DNS answer (a DNS seed gives 20 to 40), one by default
+smoltcp = { version = "0.13", default-features = false, features = ["dns-max-result-count-16"] }
 # the display's user interface: BLIT built without std, from upstream (not on crates.io: `blit`
 # there is another crate)
 blit = { git = "https://github.com/nicoburniske/blit", rev = "9013914897d3882cecd7053db5fdbdc341f1da83" }

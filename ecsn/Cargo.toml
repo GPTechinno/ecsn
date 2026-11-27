@@ -12,6 +12,7 @@ bitcoin.workspace = true
 floresta-chain.workspace = true
 rustreexo.workspace = true
 embedded-io-async.workspace = true
+embassy-futures.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

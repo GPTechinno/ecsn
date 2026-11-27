@@ -270,15 +270,6 @@ pub fn start(ui: Ui<'_>, network: &str, step: &str, details: &[&str], uptime: u6
     }
 }
 
-/// The state of the connection to the peer, as the firmware sees it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Link {
-    Connecting,
-    Connected,
-    /// The connection failed or ended; another try comes.
-    Lost,
-}
-
 /// Everything the dashboard shows.
 pub struct Dashboard<'a> {
     pub network: &'a str,
@@ -286,8 +277,6 @@ pub struct Dashboard<'a> {
     pub uptime: u64,
     pub address: Option<String>,
     pub mac: [u8; 6],
-    pub peer: &'a str,
-    pub link: Link,
     pub status: &'a ecsn::node::Status,
     pub best_header: u32,
     pub validated: u32,
@@ -306,15 +295,31 @@ pub struct Dashboard<'a> {
 /// The node's phase in words, and its color.
 fn phase(d: &Dashboard) -> (&'static str, Color) {
     use ecsn::node::Phase;
-    match (d.status.phase, d.link) {
-        (Phase::Idle, Link::Connecting) => ("Connecting to the peer", YELLOW),
-        (Phase::Idle, Link::Connected) => ("Connected", YELLOW),
-        (Phase::Idle, Link::Lost) => ("No peer, trying again", RED),
-        (Phase::Handshake, _) => ("Handshake", YELLOW),
-        (Phase::Headers, _) => ("Syncing headers", YELLOW),
-        (Phase::Assume, _) => ("Assuming the accumulator", YELLOW),
-        (Phase::Blocks, _) => ("Validating blocks", YELLOW),
-        (Phase::Following, _) => ("Following the chain", GREEN),
+    match d.status.phase {
+        Phase::Idle if d.status.bridge().is_some() => ("Connecting to a bridge", YELLOW),
+        Phase::Idle => ("No bridge, trying again", RED),
+        Phase::Handshake => ("Handshake with the bridge", YELLOW),
+        Phase::Headers => ("Syncing headers", YELLOW),
+        Phase::Assume => ("Assuming the accumulator", YELLOW),
+        Phase::Blocks => ("Validating blocks", YELLOW),
+        Phase::Following => ("Following the chain", GREEN),
+    }
+}
+
+/// A user agent's last name and version, without its comment: `utreexod:0.5.1` of
+/// `/btcwire:0.5.0/utreexod:0.5.1/`, 24 characters at most.
+fn agent(user_agent: &str) -> &str {
+    let last = user_agent
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let last = last.split('(').next().unwrap_or(last);
+    let end = last.char_indices().nth(24).map_or(last.len(), |(i, _)| i);
+    if last.is_empty() {
+        "?"
+    } else {
+        &last[..end]
     }
 }
 
@@ -462,21 +467,35 @@ fn node(p: &mut Flex<'_>, d: &Dashboard) {
         .build(|ui: Ui<'_>| text(ui, &session, 11.0, MUTED));
     gap(p);
 
-    p.child().build(|ui: Ui<'_>| title(ui, "PEER"));
-    p.child().build(|ui: Ui<'_>| bold(ui, d.peer, 15.0, TEXT));
-    match &d.status.peer {
-        Some(peer) => {
-            p.child()
-                .build(|ui: Ui<'_>| text(ui, &peer.user_agent, 11.0, MUTED));
-            let height = format!(
-                "height {} at connection",
-                grouped(peer.height.max(0) as u64)
-            );
-            p.child().build(|ui: Ui<'_>| text(ui, &height, 11.0, MUTED));
-        }
-        None => p
-            .child()
-            .build(|ui: Ui<'_>| text(ui, "not connected", 11.0, MUTED)),
+    {
+        let mut top = p.child().layout(flex::row().justify(Justify::SpaceBetween));
+        top.child().build(|ui: Ui<'_>| title(ui, "PEERS"));
+        let known = format!("{} known", grouped(d.status.known as u64));
+        top.child()
+            .build(|ui: Ui<'_>| text_right(ui, &known, 11.0, MUTED));
+    }
+    if d.status.peers.is_empty() {
+        p.child()
+            .build(|ui: Ui<'_>| text(ui, "none connected", 11.0, MUTED));
+    }
+    for peer in &d.status.peers {
+        use ecsn::node::Role;
+        let ip = peer
+            .addr
+            .map_or_else(|| String::from("?"), |a| format!("{}", a.ip()));
+        let what = match (&peer.info, peer.role) {
+            (Some(info), Role::Bridge) => format!("bridge, {}", agent(&info.user_agent)),
+            (Some(info), Role::Peer) => String::from(agent(&info.user_agent)),
+            (None, Role::Bridge) => String::from("bridge, connecting"),
+            (None, Role::Peer) => String::from("connecting"),
+        };
+        let color = if peer.info.is_some() { GREEN } else { YELLOW };
+        let mut row = p.child().layout(flex::row().gap(8.0).align(Align::Center));
+        dot(&mut row, color);
+        row.child().build(|ui: Ui<'_>| bold(ui, &ip, 13.0, TEXT));
+        row.child()
+            .item(flex::item().grow())
+            .build(|ui: Ui<'_>| text_right(ui, &what, 11.0, MUTED));
     }
     gap(p);
 

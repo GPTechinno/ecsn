@@ -72,7 +72,7 @@ const PRESSED: Color = Color::rgba(0xf2, 0xc8, 0x1e, 0x60);
 /// firmware shows with them.
 const LEDS: [(&str, [u8; 3], &str); 4] = [
     ("LD1", [0x3d, 0xf5, 0x6b], "firmware running (blinks)"),
-    ("LD2", [0xff, 0x9f, 0x1c], "connected to the peer"),
+    ("LD2", [0xff, 0x9f, 0x1c], "connected to a bridge"),
     ("LD3", [0xff, 0x40, 0x40], "not used"),
     ("LD4", [0x40, 0x8c, 0xff], "not used"),
 ];

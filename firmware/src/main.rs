@@ -1,10 +1,13 @@
 //! The ECSN node on an STM32H747I-DISCO (Cortex-M7 core): 400 MHz, the 32 MB SDRAM as the heap,
-//! Ethernet with DHCP, then the node of `ecsn` against one peer, reconnecting when the connection
-//! ends. The chain is kept on the 128 MB QSPI flash, formatted at the first start (which erases
-//! what the flash holds, in a few minutes).
+//! Ethernet with DHCP, then the node of `ecsn`: a connection to a Utreexo bridge (the configured
+//! peer first, others the node learns of after it), a few to ordinary peers for new blocks and
+//! addresses, each reconnecting to another address when it ends, and the network's DNS seeds. The
+//! chain is kept on the 128 MB QSPI flash, formatted at the first start (which erases what the
+//! flash holds, in a few minutes).
 //!
 //! Set at build time:
-//! - `ECSN_PEER` (required): the peer, `ip:port`, for example `192.168.1.10:18444`;
+//! - `ECSN_PEER` (required): the bridge tried first, `ip:port`, for example `192.168.1.10:18444`;
+//! - `ECSN_PEERS`: ordinary peers kept connected, 2 by default;
 //! - `ECSN_NETWORK`: `bitcoin`, `testnet`, `testnet4`, `signet` or `regtest` (the default);
 //! - `ECSN_ASSUME_UTREEXO`: set to start from `floresta-chain`'s accumulator of the network;
 //! - `ECSN_RAM_STORE`: set to keep the chain in RAM instead, lost on reset;
@@ -23,7 +26,7 @@
 //! the board, which resumes from the flash. The executor's stalls and the heap's peak are logged
 //! as they grow.
 //!
-//! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to the peer.
+//! LD1 (green) blinks while the firmware runs, LD2 (orange) is on while connected to a bridge.
 //! The display shows the step the firmware is at while it starts, then the node's state, redrawn
 //! every second.
 //!
@@ -46,22 +49,22 @@ mod sdram;
 mod text;
 
 use alloc::format;
+use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::MaybeUninit;
-use core::net::SocketAddrV4;
+use core::net::{IpAddr, SocketAddr, SocketAddrV4};
 use core::str::FromStr;
 
 use bitcoin::Network;
 use core::net::Ipv4Addr;
-use defmt::{error, info, unwrap, warn, Debug2Format};
+use defmt::{info, unwrap, warn, Debug2Format};
 use display::Display;
-use ecsn::node::{Config, Node, Phase};
-use ecsn::p2p::Connection;
+use ecsn::node::{Clock, Config, Dialer, Node, Phase, Resolver, Role, Source};
 use ecsn::store::{FlashChainStore, MemChainStore};
 use embassy_executor::Spawner;
 
 use ecsn::sntp;
-use embassy_futures::join::join4;
+use embassy_futures::join::{join, join5, join_array};
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -101,6 +104,14 @@ const NETWORK: Option<&str> = option_env!("ECSN_NETWORK");
 const ASSUME_UTREEXO: bool = option_env!("ECSN_ASSUME_UTREEXO").is_some();
 const RAM_STORE: bool = option_env!("ECSN_RAM_STORE").is_some();
 const BLOCKS_IN_FLIGHT: Option<&str> = option_env!("ECSN_BLOCKS_IN_FLIGHT");
+/// The ordinary peers kept connected.
+const PEERS: usize = match option_env!("ECSN_PEERS") {
+    Some(n) => parse_count(n),
+    None => 2,
+};
+/// The socket buffers of an ordinary peer: headers and addresses, a few kilobytes at a time.
+const PEER_RX: usize = 16 * 1024;
+const PEER_TX: usize = 4 * 1024;
 /// The time the `version` message carries until SNTP answers: the build's, close enough for the
 /// peer's time offset.
 const BUILD_TIME: &str = env!("ECSN_BUILD_TIME");
@@ -178,6 +189,23 @@ pub unsafe extern "C" fn bitcoin_hashes_sha256_compress(
 ) {
     // SAFETY: the caller passes the state and buffer of one of its engines.
     unsafe { bitcoin_hashes::sha256::compress(&mut *state, &*block) }
+}
+
+/// A small decimal number, at build time: anything else fails the build.
+const fn parse_count(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    assert!(
+        !bytes.is_empty() && bytes.len() <= 2,
+        "ECSN_PEERS: a number up to 99"
+    );
+    let mut n = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii_digit(), "ECSN_PEERS: a number up to 99");
+        n = n * 10 + (bytes[i] - b'0') as usize;
+        i += 1;
+    }
+    n
 }
 
 /// The magic of the network named `name`, at build time: an unknown name fails the build.
@@ -383,8 +411,8 @@ async fn main(spawner: Spawner) {
         p.PA2, // MDIO
         p.PC1, // MDC
     );
-    // DHCP, DNS, the peer's TCP socket and SNTP's UDP socket, and two spare
-    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+    // DHCP, DNS, SNTP's UDP socket, the bridge's TCP socket and the ordinary peers', and one spare
+    static RESOURCES: StaticCell<StackResources<{ 5 + PEERS }>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         device,
         embassy_net::Config::dhcpv4(Default::default()),
@@ -419,6 +447,7 @@ async fn main(spawner: Spawner) {
             Some(Ok(n)) => n,
             Some(Err(_)) => defmt::panic!("ECSN_BLOCKS_IN_FLIGHT: not a number"),
         },
+        ipv6: false,
     };
     let link = Link {
         stack,
@@ -537,6 +566,67 @@ impl defmt::Format for NtpError {
     }
 }
 
+/// The node's clock: the board's, and the time of day once SNTP answered (the build's until then).
+struct BoardClock<'a> {
+    wall: &'a WallClock,
+    build_time: i64,
+}
+
+impl Clock for BoardClock<'_> {
+    fn now(&self) -> u64 {
+        Instant::now().as_secs()
+    }
+
+    fn unix(&self) -> i64 {
+        self.wall.now().unwrap_or(self.build_time)
+    }
+
+    async fn sleep(&self, seconds: u64) {
+        Timer::after_secs(seconds).await;
+    }
+}
+
+/// A slot's TCP connections, over its own buffers.
+struct TcpDialer {
+    stack: Stack<'static>,
+    rx: &'static mut [u8],
+    tx: &'static mut [u8],
+}
+
+impl Dialer for TcpDialer {
+    type Io<'a> = TcpSocket<'a>;
+
+    async fn connect(&mut self, addr: SocketAddr) -> Option<TcpSocket<'_>> {
+        let SocketAddr::V4(addr) = addr else {
+            return None;
+        };
+        let mut socket = TcpSocket::new(self.stack, self.rx, self.tx);
+        match with_timeout(Duration::from_secs(10), socket.connect(addr)).await {
+            Ok(Ok(())) => {}
+            _ => return None,
+        }
+        // the peers ping every few minutes
+        socket.set_timeout(Some(Duration::from_secs(600)));
+        socket.set_keep_alive(Some(Duration::from_secs(60)));
+        Some(socket)
+    }
+}
+
+/// The DNS seeds' names, through the stack's resolver (IPv4).
+struct StackResolver(Stack<'static>);
+
+impl Resolver for StackResolver {
+    async fn resolve(&mut self, name: &str) -> Vec<IpAddr> {
+        match self.0.dns_query(name, DnsQueryType::A).await {
+            Ok(addresses) => addresses
+                .iter()
+                .map(|IpAddress::Ipv4(address)| IpAddr::V4(*address))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 /// Asks [`NTP_SERVER`] for the time with `cookie`: Unix milliseconds at the returned instant.
 async fn ask_time(stack: Stack<'static>, cookie: u64) -> Result<(i64, Instant), NtpError> {
     let server = match Ipv4Addr::from_str(NTP_SERVER) {
@@ -593,7 +683,6 @@ async fn follow<S: ChainStore>(
     link: Link,
     screen: Option<Screen>,
 ) -> ! {
-    let network = config.network;
     let Link {
         stack,
         peer,
@@ -609,44 +698,39 @@ async fn follow<S: ChainStore>(
         Ok(node) => node,
         Err(e) => defmt::panic!("chain: {}", Debug2Format(&e)),
     };
-    let state = Cell::new(gui::Link::Connecting);
+    node.add_address(SocketAddr::V4(peer), 0, Source::Configured);
+    let clock = BoardClock {
+        wall: &wall,
+        build_time,
+    };
 
+    // the bridge's buffers in the internal RAM, the ordinary peers' in the SDRAM
     static RX: StaticCell<[u8; 32 * 1024]> = StaticCell::new();
     static TX: StaticCell<[u8; 8 * 1024]> = StaticCell::new();
-    let rx = RX.init([0; 32 * 1024]);
-    let tx = TX.init([0; 8 * 1024]);
-    let connection = async {
-        loop {
-            let mut socket = TcpSocket::new(stack, &mut rx[..], &mut tx[..]);
-            // the peer pings every few minutes
-            socket.set_timeout(Some(Duration::from_secs(600)));
-            socket.set_keep_alive(Some(Duration::from_secs(60)));
-            info!("peer {}: connecting", Debug2Format(&peer));
-            state.set(gui::Link::Connecting);
-            if let Err(e) = socket.connect(peer).await {
-                warn!("peer {}: {}", Debug2Format(&peer), e);
-            } else {
-                connected.set_low();
-                state.set(gui::Link::Connected);
-                let mut conn = Connection::new(socket, network);
-                let now = wall.now().unwrap_or(build_time);
-                if let Err(e) = node.run(&mut conn, now).await {
-                    error!("peer {}: {}", Debug2Format(&peer), Debug2Format(&e));
-                }
-                connected.set_high();
-            }
-            state.set(gui::Link::Lost);
-            if let Ok((height, hash)) = node.chain().get_best_block() {
-                info!(
-                    "validated {=u32}, best header {=u32} {}",
-                    node.chain().get_validation_index().unwrap_or(0),
-                    height,
-                    Debug2Format(&hash)
-                );
-            }
-            Timer::after_secs(5).await;
-        }
+    let mut bridge_dialer = TcpDialer {
+        stack,
+        rx: RX.init([0; 32 * 1024]),
+        tx: TX.init([0; 8 * 1024]),
     };
+    let mut peer_dialers: [TcpDialer; PEERS] = core::array::from_fn(|_| TcpDialer {
+        stack,
+        rx: alloc::vec![0; PEER_RX].leak(),
+        tx: alloc::vec![0; PEER_TX].leak(),
+    });
+    let mut resolver = StackResolver(stack);
+    let connections = async {
+        let mut slot = 0;
+        let peers = peer_dialers.each_mut().map(|dialer| {
+            slot += 1;
+            node.run_slot(slot, Role::Peer, dialer, &clock)
+        });
+        join(
+            node.run_slot(0, Role::Bridge, &mut bridge_dialer, &clock),
+            join_array(peers),
+        )
+        .await
+    };
+    let discovery = node.discover(&mut resolver, &clock);
     let time = async {
         let mut cookie = ntp_cookie;
         loop {
@@ -706,6 +790,12 @@ async fn follow<S: ChainStore>(
             if armed {
                 watchdog.pet();
             }
+            // LD2 while a bridge is connected
+            if node.status().bridge().is_some_and(|b| b.info.is_some()) {
+                connected.set_low();
+            } else {
+                connected.set_high();
+            }
             let peak = HEAP.peak();
             if peak >= heap_peak + (1 << 20) {
                 heap_peak = peak;
@@ -722,7 +812,6 @@ async fn follow<S: ChainStore>(
         let Some(mut screen) = screen else {
             return core::future::pending::<()>().await;
         };
-        let peer_text = format!("{peer}");
         let network_name = NETWORK.unwrap_or("regtest");
         // the peer's clock at its handshake, and ours then, until SNTP answers
         let mut peer_clock: Option<(i64, Instant)> = None;
@@ -731,8 +820,13 @@ async fn follow<S: ChainStore>(
             let status = node.status();
             if status.connections != connections {
                 connections = status.connections;
-                if let Some(peer) = &status.peer {
-                    peer_clock = Some((peer.time, Instant::now()));
+                // the bridge's clock, else another peer's
+                let info = status
+                    .bridge()
+                    .and_then(|b| b.info.as_ref())
+                    .or_else(|| status.peers.iter().find_map(|p| p.info.as_ref()));
+                if let Some(info) = info {
+                    peer_clock = Some((info.time, Instant::now()));
                 }
             }
             let chain = node.chain();
@@ -751,8 +845,6 @@ async fn follow<S: ChainStore>(
                 uptime: Instant::now().as_secs(),
                 address: stack.config_v4().map(|v4| format!("{}", v4.address)),
                 mac,
-                peer: &peer_text,
-                link: state.get(),
                 status: &status,
                 best_header,
                 validated,
@@ -770,6 +862,6 @@ async fn follow<S: ChainStore>(
             Timer::after_secs(1).await;
         }
     };
-    join4(connection, time, guard, dashboard).await;
+    join5(connections, discovery, time, guard, dashboard).await;
     defmt::unreachable!()
 }

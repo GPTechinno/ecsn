@@ -1,16 +1,17 @@
 //! The Bitcoin P2P messages the node uses (protocol version 70016, BIP 144 witness blocks), with
-//! BIP 183's Utreexo proof messages, and their framing over a byte stream (the v1 transport:
-//! magic, command, length, checksum).
+//! BIP 183's Utreexo proof messages and BIP 155's `addrv2`, and their framing over a byte stream
+//! (the v1 transport: magic, command, length, checksum).
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{self, serialize, Decodable, Encodable, VarInt};
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{Block, BlockHash, Network};
-use embedded_io_async::{Read, ReadExactError, Write};
+use embedded_io_async::{Read, Write};
 use floresta_chain::{CompactLeafData, ScriptPubKeyKind};
 use rustreexo::node_hash::BitcoinNodeHash;
 
@@ -32,6 +33,12 @@ const MAX_LOCATOR: usize = 101;
 
 /// The longest user agent we take.
 const MAX_USER_AGENT: usize = 256;
+
+/// The most addresses of an `addr` or `addrv2`.
+pub const MAX_ADDR: usize = 1000;
+
+/// The longest address of an `addrv2` entry (BIP 155).
+const MAX_ADDRV2_LEN: usize = 512;
 
 /// The most inputs a block can have.
 const MAX_INPUTS_PER_BLOCK: usize = 24_386;
@@ -94,6 +101,33 @@ pub struct NetAddress {
     /// IPv6, or IPv4 mapped into IPv6.
     pub ip: [u8; 16],
     pub port: u16,
+}
+
+/// A peer's address as `addr` and `addrv2` carry it, IPv4 or IPv6: the networks the node can
+/// reach (entries of Tor, I2P or CJDNS are dropped when decoded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Address {
+    /// When it was last seen, Unix seconds.
+    pub time: u32,
+    pub services: u64,
+    pub socket: SocketAddr,
+}
+
+/// BIP 155's network IDs.
+mod net_id {
+    pub const IPV4: u8 = 1;
+    pub const IPV6: u8 = 2;
+}
+
+/// The default P2P port of `network`.
+pub fn default_port(network: Network) -> u16 {
+    match network {
+        Network::Bitcoin => 8333,
+        Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
+        Network::Signet => 38333,
+        _ => 18444,
+    }
 }
 
 /// The `version` message.
@@ -181,6 +215,14 @@ pub enum Message {
     Block(Block),
     GetUtreexoProof(GetUtreexoProof),
     UtreexoProof(UtreexoProof),
+    /// Asks for addresses of peers.
+    GetAddr,
+    /// Addresses of peers, in the format of the `version` message.
+    Addr(Vec<Address>),
+    /// Asks for addresses in `addrv2` rather than `addr` (BIP 155): sent before `verack`.
+    SendAddrV2,
+    /// Addresses of peers, in BIP 155's format.
+    AddrV2(Vec<Address>),
     /// Any other message, not decoded.
     Other {
         command: [u8; 12],
@@ -212,6 +254,10 @@ const NOTFOUND: [u8; 12] = command("notfound");
 const BLOCK: [u8; 12] = command("block");
 const GETUPROOF: [u8; 12] = command("getuproof");
 const UPROOF: [u8; 12] = command("uproof");
+const GETADDR: [u8; 12] = command("getaddr");
+const ADDR: [u8; 12] = command("addr");
+const SENDADDRV2: [u8; 12] = command("sendaddrv2");
+const ADDRV2: [u8; 12] = command("addrv2");
 
 impl Message {
     /// The command name, padded to 12 bytes.
@@ -229,6 +275,10 @@ impl Message {
             Self::Block(_) => BLOCK,
             Self::GetUtreexoProof(_) => GETUPROOF,
             Self::UtreexoProof(_) => UPROOF,
+            Self::GetAddr => GETADDR,
+            Self::Addr(_) => ADDR,
+            Self::SendAddrV2 => SENDADDRV2,
+            Self::AddrV2(_) => ADDRV2,
             Self::Other { command, .. } => *command,
         }
     }
@@ -293,6 +343,42 @@ impl Message {
                     put(&mut out, &leaf.header_code);
                     put(&mut out, &leaf.amount);
                     put(&mut out, &leaf.spk_ty);
+                }
+            }
+            Self::GetAddr | Self::SendAddrV2 => {}
+            Self::Addr(list) => {
+                put(&mut out, &VarInt(list.len() as u64));
+                for a in list {
+                    put(&mut out, &a.time);
+                    put_address(
+                        &mut out,
+                        &NetAddress {
+                            services: a.services,
+                            ip: match a.socket.ip() {
+                                IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+                                IpAddr::V6(ip) => ip.octets(),
+                            },
+                            port: a.socket.port(),
+                        },
+                    );
+                }
+            }
+            Self::AddrV2(list) => {
+                put(&mut out, &VarInt(list.len() as u64));
+                for a in list {
+                    put(&mut out, &a.time);
+                    put(&mut out, &VarInt(a.services));
+                    match a.socket.ip() {
+                        IpAddr::V4(ip) => {
+                            out.extend_from_slice(&[net_id::IPV4, 4]);
+                            out.extend_from_slice(&ip.octets());
+                        }
+                        IpAddr::V6(ip) => {
+                            out.extend_from_slice(&[net_id::IPV6, 16]);
+                            out.extend_from_slice(&ip.octets());
+                        }
+                    }
+                    out.extend_from_slice(&a.socket.port().to_be_bytes());
                 }
             }
             Self::Other { payload, .. } => out.extend_from_slice(payload),
@@ -408,6 +494,66 @@ impl Message {
                     leaf_data,
                 })
             }
+            GETADDR => Self::GetAddr,
+            SENDADDRV2 => Self::SendAddrV2,
+            ADDR => {
+                let n = get_len(r, MAX_ADDR)?;
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let time = u32::consensus_decode(r)?;
+                    let a = get_address(r)?;
+                    let ip = Ipv6Addr::from(a.ip);
+                    let ip = match ip.to_ipv4_mapped() {
+                        Some(v4) => IpAddr::V4(v4),
+                        None => IpAddr::V6(ip),
+                    };
+                    list.push(Address {
+                        time,
+                        services: a.services,
+                        socket: SocketAddr::new(ip, a.port),
+                    });
+                }
+                Self::Addr(list)
+            }
+            ADDRV2 => {
+                let n = get_len(r, MAX_ADDR)?;
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let time = u32::consensus_decode(r)?;
+                    let services = VarInt::consensus_decode(r)?.0;
+                    let network = u8::consensus_decode(r)?;
+                    let bytes = get_bytes(r, MAX_ADDRV2_LEN)?;
+                    let port = u16::from_be_bytes(<[u8; 2]>::consensus_decode(r)?);
+                    let ip = match (network, bytes.len()) {
+                        (net_id::IPV4, 4) => {
+                            IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+                        }
+                        (net_id::IPV6, 16) => {
+                            let mut octets = [0; 16];
+                            octets.copy_from_slice(&bytes);
+                            let ip = Ipv6Addr::from(octets);
+                            // BIP 155: IPv4 and Tor addresses embedded in IPv6 ones are ignored
+                            if ip.to_ipv4_mapped().is_some()
+                                || octets[..6] == [0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43]
+                            {
+                                continue;
+                            }
+                            IpAddr::V6(ip)
+                        }
+                        (net_id::IPV4 | net_id::IPV6, _) => {
+                            return Err(encode::Error::ParseFailed("address of the wrong length"))
+                        }
+                        // the other networks: not reachable from here
+                        _ => continue,
+                    };
+                    list.push(Address {
+                        time,
+                        services,
+                        socket: SocketAddr::new(ip, port),
+                    });
+                }
+                Self::AddrV2(list)
+            }
             _ => Self::Other {
                 command: *command,
                 payload: payload.to_vec(),
@@ -478,19 +624,15 @@ pub enum Error<E> {
     },
 }
 
-impl<E> From<ReadExactError<E>> for Error<E> {
-    fn from(e: ReadExactError<E>) -> Self {
-        match e {
-            ReadExactError::UnexpectedEof => Self::Closed,
-            ReadExactError::Other(e) => Self::Io(e),
-        }
-    }
-}
-
 /// A connection to a peer over a byte stream, in the v1 transport.
 pub struct Connection<T> {
     io: T,
     magic: [u8; 4],
+    /// The message being received, as far as read: its header, then its payload.
+    head: [u8; 24],
+    head_read: usize,
+    payload: Vec<u8>,
+    payload_read: usize,
 }
 
 impl<T: Read + Write> Connection<T> {
@@ -498,6 +640,10 @@ impl<T: Read + Write> Connection<T> {
         Self {
             io,
             magic: network.magic().to_bytes(),
+            head: [0; 24],
+            head_read: 0,
+            payload: Vec::new(),
+            payload_read: 0,
         }
     }
 
@@ -514,28 +660,54 @@ impl<T: Read + Write> Connection<T> {
         self.io.flush().await.map_err(Error::Io)
     }
 
-    /// Receives the next message.
+    /// Receives the next message. Cancel-safe when the stream's `read` is: a call dropped before
+    /// it returns keeps what it read, and the next call goes on from there.
     pub async fn recv(&mut self) -> Result<Message, Error<T::Error>> {
-        let mut head = [0; 24];
-        self.io.read_exact(&mut head).await?;
-        let mut magic = [0; 4];
-        magic.copy_from_slice(&head[..4]);
-        if magic != self.magic {
-            return Err(Error::WrongNetwork(magic));
+        while self.head_read < self.head.len() {
+            let n = self
+                .io
+                .read(&mut self.head[self.head_read..])
+                .await
+                .map_err(Error::Io)?;
+            if n == 0 {
+                return Err(Error::Closed);
+            }
+            self.head_read += n;
+            if self.head_read == self.head.len() {
+                let mut magic = [0; 4];
+                magic.copy_from_slice(&self.head[..4]);
+                if magic != self.magic {
+                    return Err(Error::WrongNetwork(magic));
+                }
+                let mut len = [0; 4];
+                len.copy_from_slice(&self.head[16..20]);
+                let len = u32::from_le_bytes(len);
+                if len as usize > MAX_PAYLOAD {
+                    return Err(Error::Oversized(len));
+                }
+                self.payload = vec![0; len as usize];
+                self.payload_read = 0;
+            }
         }
-        let mut command = [0; 12];
-        command.copy_from_slice(&head[4..16]);
-        let mut len = [0; 4];
-        len.copy_from_slice(&head[16..20]);
-        let len = u32::from_le_bytes(len);
-        if len as usize > MAX_PAYLOAD {
-            return Err(Error::Oversized(len));
+        while self.payload_read < self.payload.len() {
+            let n = self
+                .io
+                .read(&mut self.payload[self.payload_read..])
+                .await
+                .map_err(Error::Io)?;
+            if n == 0 {
+                return Err(Error::Closed);
+            }
+            self.payload_read += n;
         }
-        let mut payload = vec![0; len as usize];
-        self.io.read_exact(&mut payload).await?;
-        if sha256d::Hash::hash(&payload)[..4] != head[20..] {
+        // the whole message is here: the next call starts another
+        self.head_read = 0;
+        let payload = core::mem::take(&mut self.payload);
+        if sha256d::Hash::hash(&payload)[..4] != self.head[20..] {
             return Err(Error::Checksum);
         }
+        let mut command = [0; 12];
+        command.copy_from_slice(&self.head[4..16]);
         Message::decode(&command, &payload).map_err(|error| Error::Decode { command, error })
     }
 }
@@ -666,6 +838,99 @@ mod tests {
             }
             m => panic!("{m:?}"),
         }
+    }
+
+    #[test]
+    fn addr_carries_ipv4_mapped_into_ipv6() {
+        let list = vec![
+            Address {
+                time: 1_700_000_000,
+                services: services::NETWORK | services::WITNESS,
+                socket: "1.2.3.4:8333".parse().unwrap(),
+            },
+            Address {
+                time: 1,
+                services: 0,
+                socket: "[2001:db8::1]:18333".parse().unwrap(),
+            },
+        ];
+        let encoded = Message::Addr(list.clone()).encode();
+        // the count, then time, services, address and port: 30 bytes each
+        assert_eq!(encoded.len(), 1 + 2 * 30);
+        assert_eq!(
+            &encoded[13..31],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4, 0x20, 0x8d]
+        );
+        match roundtrip(Message::Addr(list.clone())) {
+            Message::Addr(l) => assert_eq!(l, list),
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn addrv2_keeps_the_ip_addresses() {
+        let mut payload = vec![3];
+        // 1.2.3.4:8333, NETWORK | WITNESS
+        payload.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+        payload.extend_from_slice(&[9, 1, 4, 1, 2, 3, 4, 0x20, 0x8d]);
+        // a Tor v3 address: dropped
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&[0, 4, 32]);
+        payload.extend_from_slice(&[0xab; 32]);
+        payload.extend_from_slice(&[0x20, 0x8d]);
+        // [2001:db8::1]:18333, UTREEXO | UTREEXO_ARCHIVE in a 3-byte CompactSize
+        payload.extend_from_slice(&5u32.to_le_bytes());
+        payload.extend_from_slice(&[0xfd, 0x00, 0x30, 2, 16, 0x20, 0x01, 0x0d, 0xb8]);
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x47, 0x9d]);
+        let expected = vec![
+            Address {
+                time: 1_700_000_000,
+                services: 9,
+                socket: "1.2.3.4:8333".parse().unwrap(),
+            },
+            Address {
+                time: 5,
+                services: services::UTREEXO | services::UTREEXO_ARCHIVE,
+                socket: "[2001:db8::1]:18333".parse().unwrap(),
+            },
+        ];
+        match Message::decode(&ADDRV2, &payload).unwrap() {
+            Message::AddrV2(list) => assert_eq!(list, expected),
+            m => panic!("{m:?}"),
+        }
+        match roundtrip(Message::AddrV2(expected.clone())) {
+            Message::AddrV2(list) => assert_eq!(list, expected),
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn addrv2_refuses_an_ipv4_address_of_the_wrong_length() {
+        let mut payload = vec![1];
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&[9, 1, 5, 1, 2, 3, 4, 5, 0x20, 0x8d]);
+        assert!(Message::decode(&ADDRV2, &payload).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_receive_dropped_halfway_goes_on_from_there() {
+        use embedded_io_adapters::tokio_1::FromTokio;
+        use tokio::io::AsyncWriteExt;
+
+        let (ours, mut theirs) = tokio::io::duplex(1 << 10);
+        let mut conn = Connection::new(FromTokio::new(ours), Network::Regtest);
+        let payload = Message::Ping(7).encode();
+        let mut frame = Network::Regtest.magic().to_bytes().to_vec();
+        frame.extend_from_slice(&PING);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&sha256d::Hash::hash(&payload)[..4]);
+        frame.extend_from_slice(&payload);
+        // the header and part of the payload, then the receive is dropped
+        theirs.write_all(&frame[..28]).await.unwrap();
+        let wait = std::time::Duration::from_millis(20);
+        assert!(tokio::time::timeout(wait, conn.recv()).await.is_err());
+        theirs.write_all(&frame[28..]).await.unwrap();
+        assert!(matches!(conn.recv().await.unwrap(), Message::Ping(7)));
     }
 
     #[test]

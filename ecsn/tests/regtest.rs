@@ -20,6 +20,7 @@ fn node_at_110(fixture: &Fixture) -> Node<MemChainStore> {
         user_agent: String::new(),
         assume_utreexo: None,
         blocks_in_flight: 1,
+        ipv6: false,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     for block in &fixture.blocks {

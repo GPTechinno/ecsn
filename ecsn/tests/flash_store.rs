@@ -23,6 +23,7 @@ fn config() -> Config {
         user_agent: String::new(),
         assume_utreexo: None,
         blocks_in_flight: 1,
+        ipv6: false,
     }
 }
 

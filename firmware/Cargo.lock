@@ -464,6 +464,7 @@ name = "ecsn"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "embassy-futures",
  "embedded-io-async 0.7.0",
  "floresta-chain",
  "rustreexo",
@@ -496,6 +497,7 @@ dependencies = [
  "floresta-chain",
  "fontdue",
  "panic-probe",
+ "smoltcp",
  "static_cell",
  "stm32-fmc",
  "tracing",

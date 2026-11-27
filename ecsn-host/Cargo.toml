@@ -18,3 +18,4 @@ tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
