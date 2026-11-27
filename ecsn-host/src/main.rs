@@ -135,6 +135,10 @@ impl Resolver for SystemResolver {
     }
 }
 
+fn heap_free() -> usize {
+    HEAP.free()
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -178,6 +182,8 @@ async fn main() -> ExitCode {
         ipv6: args.ipv6,
         v2: !args.v1,
         v2_bridge: !args.v1,
+        // the blocks in flight fit the heap left under the limit, as on a board
+        free_memory: args.heap_limit.map(|_| heap_free as fn() -> usize),
     };
 
     let Some(path) = &args.store else {

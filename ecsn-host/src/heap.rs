@@ -30,6 +30,11 @@ impl Counted {
         self.peak.load(Relaxed)
     }
 
+    /// Bytes left under the limit.
+    pub fn free(&self) -> usize {
+        self.limit.load(Relaxed).saturating_sub(self.used())
+    }
+
     /// Fails the allocations that would take the bytes in use beyond `limit`.
     pub fn set_limit(&self, limit: usize) {
         self.limit.store(limit, Relaxed);

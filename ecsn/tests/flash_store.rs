@@ -26,6 +26,7 @@ fn config() -> Config {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory: None,
     }
 }
 

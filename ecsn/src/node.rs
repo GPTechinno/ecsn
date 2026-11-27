@@ -61,10 +61,20 @@ pub struct Config {
     pub v2: bool,
     /// Whether it is tried with the bridge too, whose blocks then cost their decryption.
     pub v2_bridge: bool,
+    /// The bytes the heap has left, if known: while syncing, a block is asked for only if they
+    /// leave room for it (beyond the first block in flight, always asked for).
+    pub free_memory: Option<fn() -> usize>,
 }
 
 /// Validated heights between two progress lines while syncing.
 const PROGRESS_EVERY: u32 = 1000;
+
+/// The heap kept free while syncing for a block's validation and for the decoding of the block
+/// arriving (its payload and the block it becomes, side by side).
+const MEMORY_RESERVE: usize = 8 << 20;
+/// The heap a block asked for takes once here (a mainnet block of 2 MB takes about twice that
+/// decoded), counted for each block asked and not here yet.
+const BLOCK_ROOM: usize = 4 << 20;
 
 /// Seconds a slot waits when the book has no address for it.
 const IDLE: u64 = 5;
@@ -594,9 +604,18 @@ impl<S: ChainStore> Node<S> {
         let mut best = best.min(self.bridge_best.get());
         let mut asked = self.chain.get_validation_index()?;
         let mut in_flight: VecDeque<InFlight> = VecDeque::new();
+        let mut held = false;
         loop {
             let mut inventory = Vec::new();
             while asked < best && in_flight.len() < window {
+                if !in_flight.is_empty() && !self.room_for_another(&in_flight) {
+                    if !held {
+                        debug!("{} blocks in flight: no room for more", in_flight.len());
+                    }
+                    held = true;
+                    break;
+                }
+                held = false;
                 asked += 1;
                 let hash = self.chain.get_block_hash(asked)?;
                 inventory.push(Inventory::witness_block(hash));
@@ -699,6 +718,16 @@ impl<S: ChainStore> Node<S> {
                 other => self.note(&other),
             }
         }
+    }
+
+    /// Whether the heap left takes one more block asked for: the reserve, and the room of each
+    /// block asked and not here yet, that one included. Yes when the heap left is not known.
+    fn room_for_another(&self, in_flight: &VecDeque<InFlight>) -> bool {
+        let Some(free) = self.config.free_memory else {
+            return true;
+        };
+        let coming = in_flight.iter().filter(|b| b.block.is_none()).count() + 1;
+        free() >= MEMORY_RESERVE + coming * BLOCK_ROOM
     }
 
     /// Validates the block at `height`, the one after the last validated, with the outputs it

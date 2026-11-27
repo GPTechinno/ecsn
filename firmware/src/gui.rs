@@ -530,7 +530,7 @@ fn node(p: &mut Flex<'_>, d: &Dashboard) {
             .build(|ui: Ui<'_>| text(ui, "Chain in RAM", 13.0, TEXT)),
     }
     let (used, size) = d.heap;
-    let heap = format!("Heap {} / {} MB", megabytes(used), size >> 20);
+    let heap = format!("RAM {} / {} MB", megabytes(used), size >> 20);
     p.child().build(|ui: Ui<'_>| text(ui, &heap, 13.0, TEXT));
     bar(p, RIGHT_INNER, 6.0, (used as u64, size as u64), ORANGE);
 }

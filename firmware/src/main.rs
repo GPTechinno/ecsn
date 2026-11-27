@@ -475,6 +475,7 @@ async fn main(spawner: Spawner) {
         ipv6: false,
         v2: !V1,
         v2_bridge: !V1_BRIDGE && !V1,
+        free_memory: Some(|| HEAP.free()),
     };
     let link = Link {
         stack,

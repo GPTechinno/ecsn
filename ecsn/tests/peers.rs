@@ -29,6 +29,7 @@ fn node() -> Node<MemChainStore> {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory: None,
     };
     Node::new(MemChainStore::new(), config, 0).unwrap()
 }

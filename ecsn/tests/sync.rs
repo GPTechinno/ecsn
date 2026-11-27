@@ -92,6 +92,15 @@ async fn peer(io: DuplexStream, fixture: &Fixture, order: Order) -> Vec<usize> {
 /// Syncs a node with `blocks_in_flight` from the fixture's peer, checks the accumulator it
 /// ends with, and returns the length of each `getdata` it sent.
 fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
+    sync_in(blocks_in_flight, order, None)
+}
+
+/// [`sync`] with the heap left reported by `free_memory`.
+fn sync_in(
+    blocks_in_flight: usize,
+    order: Order,
+    free_memory: Option<fn() -> usize>,
+) -> Vec<usize> {
     let fixture = fixture();
     let config = Config {
         network: Network::Regtest,
@@ -101,6 +110,7 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -137,6 +147,29 @@ fn sync(blocks_in_flight: usize, order: Order) -> Vec<usize> {
     assert_eq!(last.transactions, fixture.blocks[110].txdata.len());
     assert_eq!(last.inputs, fixture.leaf_data.len());
     asked
+}
+
+fn ten_mib() -> usize {
+    10 << 20
+}
+
+fn eighteen_mib() -> usize {
+    18 << 20
+}
+
+#[test]
+fn one_block_at_a_time_when_the_heap_has_room_for_no_more() {
+    // 10 MiB: the reserve (8) and one block coming (4) do not fit
+    let asked = sync_in(8, Order::AsAsked, Some(ten_mib));
+    assert!(asked.iter().all(|n| *n == 1), "{asked:?}");
+}
+
+#[test]
+fn two_blocks_at_a_time_when_the_heap_has_room_for_two() {
+    // 18 MiB: the reserve (8) and two blocks coming (2 x 4) fit, not three
+    let asked = sync_in(8, Order::AsAsked, Some(eighteen_mib));
+    assert_eq!(asked[0], 2);
+    assert!(asked.iter().all(|n| *n <= 2), "{asked:?}");
 }
 
 #[test]
@@ -237,6 +270,7 @@ fn a_block_announced_during_a_sync_is_followed() {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory: None,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -319,6 +353,7 @@ fn a_reset_during_the_header_sync_keeps_the_headers_synced() {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory: None,
     };
     let node = Node::new(store, config(), 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -403,6 +438,7 @@ fn the_next_batch_of_headers_is_asked_for_before_checking_one() {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory: None,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()

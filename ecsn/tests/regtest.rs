@@ -23,6 +23,7 @@ fn node_at_110(fixture: &Fixture) -> Node<MemChainStore> {
         ipv6: false,
         v2: true,
         v2_bridge: true,
+        free_memory: None,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     for block in &fixture.blocks {

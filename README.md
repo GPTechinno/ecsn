@@ -62,7 +62,9 @@ ecsn-host --network regtest            # or --follow to keep following new block
 
 While syncing, the node asks for `--blocks-in-flight` blocks at once (16 by default, 4 on the
 board), the proof of each as it comes, and validates them in order; it saves the chain after each
-block validated.
+block validated. When the heap left is known (the board's, or under `--heap-limit`), it asks for
+fewer: beyond the first block in flight, one more only if the heap left keeps 8 MiB free for a
+validation and the decoding of a block, plus 4 MiB for each block asked and not here yet.
 
 With `--follow` the node keeps a connection to a bridge (the peer given first, then any address
 whose services include `NODE_UTREEXO_ARCHIVE`) and `--peers` (2 by default) to ordinary peers, each
@@ -89,7 +91,7 @@ file starts from what it holds. The emulator's flash images are such files.
 
 `ecsn-host` logs the heap's peak as it grows by a MiB, the bytes allocated at once at most, and
 `--heap-limit <MiB>` fails the allocations beyond that many MiB, as the board's 32 MB of SDRAM
-does (its structures take more there, with 64-bit pointers).
+does (its structures take more there, with 64-bit pointers), and fits the blocks in flight to it.
 
 `ecsn/tests/data/regtest-111.txt` is such a chain recorded from utreexod (blocks 1 to 111, block
 111's Utreexo data and the accumulator after it), which the tests validate and tamper with.
@@ -160,7 +162,7 @@ starts (DHCP, the chain store), then the node, redrawn every second: the validat
 its progress, the validated tip (hash, time, age, transactions, inputs proven, size), the node's
 phase, the peers (the bridge and the ordinary peers: address, client, `v2` when encrypted, the
 addresses known),
-the board's address and MAC, the flash and heap in use, the accumulator. Until SNTP answers, the
+the board's address and MAC, the flash and the RAM in use (the SDRAM, the heap), the accumulator. Until SNTP answers, the
 clock is the bridge's, taken from its `version` message. The firmware tells the panel's controller (OTM8009A on the first boards, NT35510 on later
 ones) from its ID, and runs without the display if neither answers.
 
