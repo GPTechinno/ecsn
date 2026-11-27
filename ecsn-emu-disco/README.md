@@ -56,7 +56,7 @@ cargo run --release -- --headless --seconds 30 --realtime --volatile  # logs on 
 | `--seconds <S>` | the virtual time a headless run lasts, 10 s by default |
 | `--realtime` | headless, virtual time no faster than the wall clock (for real peers); the window always paces so. A board fallen behind, its core busy, does not catch up |
 | `--screen-png <PNG>` | headless, what the display shows at the end |
-| `--no-host-sha` | run the firmware's SHA-256 compression (its `bitcoin_hashes_sha256_compress`) on the emulated core. By default the host runs it after its first three calls, which the core runs to measure their cycles (2,416 a block) and check the host's results; each later call then costs those cycles, so the virtual time is the same and the wall time shorter |
+| `--no-host-sha` | run the firmware's SHA-256 and SHA-512 compressions (its `bitcoin_hashes_sha256_compress` and `bitcoin_hashes_sha512_compress`) on the emulated core. By default the host runs each after its first three calls, which the core runs to measure their cycles (2,416 a SHA-256 block, 9,528 a SHA-512 one) and check the host's results; each later call then costs those cycles, so the virtual time is the same and the wall time shorter |
 | `--profile <S>` | sample the PC every millisecond, and print the busiest functions with their callers every this many seconds and at the end |
 | `--trace` | the PC and the core clock every millisecond |
 | `--mmio-trace <START:END>` | every peripheral access in a range of addresses, in hexadecimal |

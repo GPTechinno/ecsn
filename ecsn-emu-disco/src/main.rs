@@ -75,9 +75,9 @@ struct Args {
     /// NT35510 of later ones; `none` for no panel on the DSI link
     #[arg(long, value_enum, default_value = "otm8009a")]
     panel: Controller,
-    /// Run the firmware's SHA-256 compression on the emulated core too; by
-    /// default the host runs it, charged the cycles the core took for its
-    /// first calls, so virtual time is the same
+    /// Run the firmware's SHA-256 and SHA-512 compressions on the emulated core
+    /// too; by default the host runs them, charged the cycles the core took for
+    /// their first calls, so virtual time is the same
     #[arg(long)]
     no_host_sha: bool,
     /// Save what the display shows as a PNG at the end of a headless run

@@ -128,6 +128,9 @@ impl Disco {
         if host_sha && let Some(entry) = symbol(elf, SHA256_COMPRESS) {
             machine.host_function(entry, SHA256_COMPRESS, Box::new(Sha256Compress::default()));
         }
+        if host_sha && let Some(entry) = symbol(elf, SHA512_COMPRESS) {
+            machine.host_function(entry, SHA512_COMPRESS, Box::new(Sha512Compress::default()));
+        }
         let panel = Panel::new(controller);
         let state = panel.state.clone();
         {
@@ -324,6 +327,8 @@ impl Disco {
 
 /// The firmware's SHA-256 block compression (`bitcoin_hashes`' `sha256-extern` feature).
 const SHA256_COMPRESS: &str = "bitcoin_hashes_sha256_compress";
+/// The firmware's SHA-512 block compression (`bitcoin_hashes`' `sha512-extern` feature).
+const SHA512_COMPRESS: &str = "bitcoin_hashes_sha512_compress";
 
 /// The address of the ELF's symbol `name`.
 fn symbol(elf: &[u8], name: &str) -> Option<u32> {
@@ -371,6 +376,57 @@ impl Sha256Compress {
 }
 
 impl HostFunction for Sha256Compress {
+    fn run(&mut self, cpu: &mut CortexMCpu) {
+        let state = Self::compute(cpu);
+        let bytes: Vec<u8> = state.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let at = cpu.get_gpr(0) as u32;
+        let _ = cpu.memory_mut().write(u64::from(at), &bytes);
+    }
+
+    fn expect(&mut self, cpu: &CortexMCpu) {
+        self.at = cpu.get_gpr(0) as u32;
+        self.expected = Self::compute(cpu);
+    }
+
+    fn matches(&mut self, cpu: &CortexMCpu) -> bool {
+        // r0 is free in the callee: the state's address is taken at the entry
+        Self::state_at(cpu, self.at) == self.expected
+    }
+}
+
+/// `bitcoin_hashes_sha512_compress(state: *mut [u64; 8], block: *const [u8; 128])` on the host.
+#[derive(Default)]
+struct Sha512Compress {
+    /// Where the state of the call the core runs is, and what it should become.
+    at: u32,
+    expected: [u64; 8],
+}
+
+impl Sha512Compress {
+    /// The state at `at`, eight double words in the core's byte order.
+    fn state_at(cpu: &CortexMCpu, at: u32) -> [u64; 8] {
+        let mut bytes = [0; 64];
+        let _ = cpu.memory().read(u64::from(at), &mut bytes);
+        std::array::from_fn(|i| {
+            let mut word = [0; 8];
+            word.copy_from_slice(&bytes[8 * i..8 * i + 8]);
+            u64::from_le_bytes(word)
+        })
+    }
+
+    /// The state at r0 once the block at r1 is compressed into it.
+    fn compute(cpu: &CortexMCpu) -> [u64; 8] {
+        let mut state = Self::state_at(cpu, cpu.get_gpr(0) as u32);
+        let mut block = [0; 128];
+        let _ = cpu
+            .memory()
+            .read(u64::from(cpu.get_gpr(1) as u32), &mut block);
+        sha2::compress512(&mut state, &[block.into()]);
+        state
+    }
+}
+
+impl HostFunction for Sha512Compress {
     fn run(&mut self, cpu: &mut CortexMCpu) {
         let state = Self::compute(cpu);
         let bytes: Vec<u8> = state.iter().flat_map(|word| word.to_le_bytes()).collect();

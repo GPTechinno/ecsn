@@ -214,6 +214,23 @@ const fn parse_count(s: &str) -> usize {
     n
 }
 
+/// SHA-512's block compression for `bitcoin_hashes` 1.1 (its `sha512-extern` feature), the
+/// accumulator's hashes: its software one, behind a symbol of its own, which the emulator runs
+/// natively.
+///
+/// # Safety
+///
+/// `state` and `block` point to a state and a block that nothing else accesses during the call.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn bitcoin_hashes_sha512_compress(
+    state: *mut [u64; 8],
+    block: *const [u8; 128],
+) {
+    // SAFETY: the caller passes the state of one of its engines and a block of its input.
+    unsafe { bitcoin_hashes_1::sha512::compress(&mut *state, &*block) }
+}
+
 /// The magic of the network named `name`, at build time: an unknown name fails the build.
 const fn network_magic(name: &str) -> [u8; 4] {
     match name.as_bytes() {

@@ -27,7 +27,9 @@ headers (branch `perf-chain-walks`), and its header acceptance hashing each head
 upstream yet. The firmware also takes `bitcoin_hashes` 0.14.101 from the `hashes-sha256-extern`
 branch of [GPTechinno/rust-bitcoin](https://github.com/GPTechinno/rust-bitcoin) (a `[patch]`): its
 SHA-256 compression is then the firmware's `bitcoin_hashes_sha256_compress`, which the emulator
-runs on the host.
+runs on the host. Likewise `bitcoin_hashes` 1.1.0, whose SHA-512 makes the accumulator's hashes
+(through rustreexo), from the fork's `hashes-1.1-sha512-extern` branch with its `sha512-extern`
+feature: `bitcoin_hashes_sha512_compress`.
 
 The workspace and the firmware take `rustreexo` 0.7.0 from the `proof-memory` branch of
 [GPTechinno/rustreexo](https://github.com/GPTechinno/rustreexo) (a `[patch]`): it checks a proof

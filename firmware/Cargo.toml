@@ -17,6 +17,9 @@ bitcoin = { version = "0.32.8", default-features = false }
 # SHA-256's block compression through `bitcoin_hashes_sha256_compress` (see `src/main.rs`), which
 # the emulator runs natively
 bitcoin_hashes = { version = "0.14.101", default-features = false, features = ["sha256-extern"] }
+# SHA-512's block compression, the accumulator's hashes (`bitcoin_hashes` 1.1 through rustreexo),
+# through `bitcoin_hashes_sha512_compress` (see `src/main.rs`), which the emulator runs natively
+bitcoin_hashes_1 = { package = "bitcoin_hashes", version = "1.1", default-features = false, features = ["sha512-extern"] }
 # floresta-chain without std (getfloresta/Floresta#1501, merged), with its walks back along the
 # chain and its header acceptance hashing each header once (not upstream yet): the
 # `perf-header-sync` branch of the fork, on its `perf-chain-walks`
@@ -79,6 +82,9 @@ opt-level = 3
 # fork of rust-bitcoin, from its `0.32.xxx`
 bitcoin_hashes = { git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-sha256-extern" }
 bitcoin-io = { git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-sha256-extern" }
+# bitcoin_hashes 1.1.0 with the `sha512-extern` feature: the `hashes-1.1-sha512-extern` branch of the
+# fork of rust-bitcoin, from its `bitcoin_hashes-1.1.0`
+bitcoin_hashes_1 = { package = "bitcoin_hashes", git = "https://github.com/GPTechinno/rust-bitcoin", branch = "hashes-1.1-sha512-extern" }
 # rustreexo 0.7.0 whose proofs are checked without copying their hashes nor reserving twice their
 # nodes, which a mainnet block's proof does not fit in the heap without: the `proof-memory` branch
 # of the fork, from its `v0.7.0`
