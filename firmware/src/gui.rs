@@ -290,6 +290,8 @@ pub struct Dashboard<'a> {
     pub capacity: Option<u32>,
     /// Heap used and its size, bytes.
     pub heap: (usize, usize),
+    /// The most serialized bytes the mempool holds; 0 without a mempool.
+    pub mempool_cap: usize,
 }
 
 /// The node's phase in words, and its color.
@@ -326,6 +328,8 @@ fn agent(user_agent: &str) -> &str {
 /// The left column's width, and its panels' inner width.
 const LEFT: f32 = 452.0;
 const LEFT_INNER: f32 = LEFT - 28.0;
+/// The mempool's fill, beside its numbers.
+const MEMPOOL_BAR: f32 = 140.0;
 /// The right column's panel's inner width.
 const RIGHT_INNER: f32 = 800.0 - 3.0 * 12.0 - LEFT - 28.0;
 
@@ -346,6 +350,9 @@ pub fn dashboard(ui: Ui<'_>, d: &Dashboard) {
                 .layout(flex::column().gap(12.0).align(Align::Stretch));
             panel(&mut left, flex::item(), |p| validated(p, d));
             panel(&mut left, flex::item().grow(), |p| tip(p, d));
+            if d.mempool_cap > 0 {
+                panel(&mut left, flex::item(), |p| mempool(p, d));
+            }
         }
         panel(&mut body, flex::item().grow(), |p| node(p, d));
     }
@@ -384,7 +391,11 @@ fn validated(p: &mut Flex<'_>, d: &Dashboard) {
     }
     let height = grouped(u64::from(d.validated));
     p.child().build(|ui: Ui<'_>| bold(ui, &height, 54.0, TEXT));
-    let of = format!("of {} headers", grouped(u64::from(d.best_header)));
+    let behind = d.best_header.saturating_sub(d.validated);
+    let mut of = format!("of {} headers", grouped(u64::from(d.best_header)));
+    if behind > 0 {
+        let _ = write!(of, ", {} to go", grouped(u64::from(behind)));
+    }
     p.child().build(|ui: Ui<'_>| text(ui, &of, 15.0, MUTED));
     let done = (u64::from(d.validated), u64::from(d.best_header));
     let synced = d.validated >= d.best_header;
@@ -409,23 +420,14 @@ fn validated(p: &mut Flex<'_>, d: &Dashboard) {
                 );
             });
     }
-    let behind = d.best_header.saturating_sub(d.validated);
-    let note = if behind == 0 {
-        String::from("at the best header")
-    } else {
-        format!("{} blocks to go", grouped(u64::from(behind)))
-    };
-    p.child().build(|ui: Ui<'_>| text(ui, &note, 13.0, MUTED));
 }
 
 /// The validated tip: its hash, time and age, and the last block's contents.
 fn tip(p: &mut Flex<'_>, d: &Dashboard) {
-    p.child().build(|ui: Ui<'_>| title(ui, "TIP"));
-    match &d.tip {
-        Some((hash, time)) => {
-            let (first, second) = hash.split_at(32);
-            p.child().build(|ui: Ui<'_>| mono(ui, first, 14.0, TEXT));
-            p.child().build(|ui: Ui<'_>| mono(ui, second, 14.0, TEXT));
+    {
+        let mut top = p.child().layout(flex::row().justify(Justify::SpaceBetween));
+        top.child().build(|ui: Ui<'_>| title(ui, "TIP"));
+        if let Some((_, time)) = &d.tip {
             let mut when = format!("{} UTC", date_time(i64::from(*time)));
             if let Some(now) = d.clock {
                 let age = now - i64::from(*time);
@@ -433,7 +435,15 @@ fn tip(p: &mut Flex<'_>, d: &Dashboard) {
                     let _ = write!(when, ", {} ago", duration(age as u64));
                 }
             }
-            p.child().build(|ui: Ui<'_>| text(ui, &when, 13.0, MUTED));
+            top.child()
+                .build(|ui: Ui<'_>| text_right(ui, &when, 11.0, MUTED));
+        }
+    }
+    match &d.tip {
+        Some((hash, _)) => {
+            let (first, second) = hash.split_at(32);
+            p.child().build(|ui: Ui<'_>| mono(ui, first, 14.0, TEXT));
+            p.child().build(|ui: Ui<'_>| mono(ui, second, 14.0, TEXT));
         }
         None => p
             .child()
@@ -533,6 +543,50 @@ fn node(p: &mut Flex<'_>, d: &Dashboard) {
     let heap = format!("RAM {} / {} MB", megabytes(used), size >> 20);
     p.child().build(|ui: Ui<'_>| text(ui, &heap, 13.0, TEXT));
     bar(p, RIGHT_INNER, 6.0, (used as u64, size as u64), ORANGE);
+}
+
+/// The mempool: what came, what it holds and its lowest fee rate, and how full it is.
+fn mempool(p: &mut Flex<'_>, d: &Dashboard) {
+    let m = d.status.mempool;
+    {
+        let mut top = p.child().layout(flex::row().justify(Justify::SpaceBetween));
+        top.child().build(|ui: Ui<'_>| title(ui, "MEMPOOL"));
+        let came = format!(
+            "{} taken, {} refused, {} waiting",
+            grouped(u64::from(d.status.taken)),
+            grouped(u64::from(d.status.refused)),
+            m.orphans
+        );
+        top.child()
+            .build(|ui: Ui<'_>| text_right(ui, &came, 11.0, MUTED));
+    }
+    let held = format!(
+        "{} tx, {}, from {}.{} sat/vB",
+        grouped(m.transactions as u64),
+        size(m.bytes),
+        m.min_rate / 1000,
+        m.min_rate % 1000 / 100
+    );
+    let mut row = p.child().layout(flex::row().gap(12.0).align(Align::Center));
+    row.child()
+        .item(flex::item().width(Sizing::grow()))
+        .build(|ui: Ui<'_>| text(ui, &held, 13.0, TEXT));
+    bar(
+        &mut row,
+        MEMPOOL_BAR,
+        6.0,
+        (m.bytes as u64, d.mempool_cap as u64),
+        ORANGE,
+    );
+}
+
+/// Bytes in kilobytes, or in megabytes with a decimal from 1 MB (decimal units, rounded down).
+fn size(bytes: usize) -> String {
+    if bytes < 1_000_000 {
+        format!("{} kB", bytes / 1000)
+    } else {
+        format!("{}.{} MB", bytes / 1_000_000, bytes % 1_000_000 / 100_000)
+    }
 }
 
 /// Space between the sections of a panel.

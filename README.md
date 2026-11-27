@@ -14,7 +14,7 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 
 | Crate | |
 |---|---|
-| `ecsn` | `no_std`: the P2P messages (the v1 transport and BIP 324's v2, BIP 183's `getuproof`/`uproof`, BIP 155's `addrv2`), chain stores in RAM and on NOR flash, the address book and the DNS seeds, the node over any `embedded-io-async` stream: a bridge's connection (handshake, header sync, block validation, following new blocks) and ordinary peers' (headers, block announcements, addresses), each in a slot that reconnects to another address when it ends |
+| `ecsn` | `no_std`: the P2P messages (the v1 transport and BIP 324's v2, BIP 183's `getuproof`/`uproof`/`utreexotx`, BIP 155's `addrv2`), chain stores in RAM and on NOR flash, the address book and the DNS seeds, a mempool of transactions checked with their Utreexo proofs, the node over any `embedded-io-async` stream: a bridge's connection (handshake, header sync, block validation, following new blocks, the transactions it relays) and ordinary peers' (headers, block announcements, addresses), each in a slot that reconnects to another address when it ends |
 | `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file |
 | `ecsn-regtest` | fills a regtest node with blocks spending outputs of earlier blocks and of their own |
 | `ecsn-mempool` | records the transactions and blocks the network relays, raw, with their time |
@@ -102,6 +102,31 @@ does (its structures take more there, with 64-bit pointers), and fits the blocks
 
 `ecsn/tests/data/regtest-111.txt` is such a chain recorded from utreexod (blocks 1 to 111, block
 111's Utreexo data and the accumulator after it), which the tests validate and tamper with.
+
+## The mempool
+
+Once synced, the node asks the bridge for its transactions (`relay` and `NODE_UTREEXO` in its
+`version`, toward the bridge only). As utreexod does for a Utreexo peer, the bridge announces each
+transaction with the positions in the accumulator of the leaves it spends (in the same `inv`, or
+going on in the next one); the node asks for it as a `utreexotx` with the positions of the proof
+hashes it needs (it caches none), once, and checks what comes against the accumulator of its
+validated tip (`ecsn::mempool`): the proof, the outputs spent (in the accumulator, or of
+transactions it holds), the amounts, the maturity of the coinbase outputs spent, the lock times;
+not the scripts, as for blocks. The proof is then dropped: a transaction stays valid until a block
+confirms it or spends what it spends, which the block's inputs tell, and a block off the tip it
+was checked on (a reorganisation) empties the mempool. A transaction spending what another one
+held spends replaces it, and what spends from it, only paying more in all and per vbyte; one
+spending outputs of a transaction not held waits aside for it until the next block. Beyond the cap
+(`--mempool`, MB of serialized transactions; `ECSN_MEMPOOL` on the board) the lowest fee rates
+leave first, with what spends from them; on the board no transaction is asked for while the heap
+is short. The mempool is off by default (below).
+
+utreexod 0.5.1 changes its own copy of a transaction each time it sends it as a `utreexotx` (the
+output indexes of its inputs shifted): the node asks for each transaction once, and takes only
+those whose txid it asked for. The bridge's later sends of that transaction, to anyone, carry the
+changed copy, which ordinary peers asking for it as a `tx` take for an invalid transaction and may
+punish the bridge for. So the mempool is off unless asked for (`--mempool 4` with `--follow`,
+`ECSN_MEMPOOL=4` for the firmware) until bridges carry a fix.
 
 ## A mempool on the board's heap
 
@@ -259,7 +284,12 @@ ends a headless run as `--seconds` does: the statistics, the profile, the QSPI i
 - One bridge at a time and a few ordinary peers (`ecsn/tests/peers.rs`; checked on mainnet from
   the host and the emulated board), the v1 and v2 transports (`ecsn/src/p2p.rs`'s tests: messages
   both ways, a 162 kB message received with its receive dropped every millisecond, a v1 peer; the
-  bridge and Bitcoin Core 32.1 peers in v2 on mainnet), no mempool, no script check.
+  bridge and Bitcoin Core 32.1 peers in v2 on mainnet), no script check.
+- The mempool (`ecsn/tests/mempool.rs`: block 111's transactions with the parts of the block's
+  proof that prove what each spends, tampered with, with their conflicts, orphans, the cap and the
+  block; a bridge in the same process relaying them as utreexod does); on mainnet from the host
+  against the bridge (utreexod 0.5.1: 1,417 transactions taken and 1 refused in 5 minutes),
+  and on the emulated board.
 - The firmware runs on the emulated board (not yet on a real one): SDRAM, Ethernet with DHCP, the
   chain store formatted and mounted on the QSPI flash, synced and following utreexod, restarted and
   reorged; and on signet with assume-utreexo, from an erased flash to the tip, through the public

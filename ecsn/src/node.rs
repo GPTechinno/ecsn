@@ -8,13 +8,20 @@
 //! connection runs in a slot ([`Node::run_slot`]) that connects to one address of the book after
 //! another; the DNS seeds fill the book at the start ([`Node::discover`]).
 //!
+//! Once synced, the bridge relays unconfirmed transactions with their Utreexo proofs (BIP 183's
+//! `utreexotx`) to a mempool ([`Config::mempool`]): each announced with the positions of the
+//! leaves it spends, asked for with the positions of the proof hashes that prove them, checked
+//! against the accumulator of the validated tip when it comes ([`crate::mempool`]). A transaction
+//! whose parent is not held waits aside for it. Each transaction is asked for once: utreexod
+//! 0.5.1 changes its own copy of a transaction each time it sends one.
+//!
 //! Everything runs in one task: the connections share the node through `&Node`.
 //!
 //! Scripts are not checked (`floresta-chain` without `bitcoinkernel`): a block is accepted on
 //! its proof of work, its structure, its Utreexo proof, the amounts and the other rules
 //! `floresta-chain` checks.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -24,7 +31,7 @@ use core::net::{IpAddr, SocketAddr};
 use core::task::{Poll, Waker};
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, Network};
+use bitcoin::{Block, BlockHash, Network, Txid};
 use embassy_futures::select::{select, Either};
 use embedded_io_async::{Read, Write};
 use floresta_chain::extensions::BlockExt;
@@ -40,9 +47,10 @@ use tracing::{debug, info, warn};
 
 use crate::addrbook::{dns_seeds, AddrBook};
 pub use crate::addrbook::{Outcome, Role, Source};
+use crate::mempool::{proof_positions, Mempool, MempoolStats, Reject};
 use crate::p2p::{
-    self, services, Connection, GetUtreexoProof, Inventory, Message, NetAddress, Version,
-    MAX_HEADERS, PROTOCOL_VERSION,
+    self, inv, services, Connection, GetUtreexoProof, Inventory, Message, NetAddress, UtreexoTx,
+    Version, MAX_HEADERS, PROTOCOL_VERSION,
 };
 
 /// What the node is set up with.
@@ -65,6 +73,9 @@ pub struct Config {
     /// is asked for only if they leave room for it (beyond the first block in flight, always
     /// asked for).
     pub free_memory: Option<fn() -> (usize, usize)>,
+    /// The most serialized bytes of unconfirmed transactions the mempool holds; 0 for no
+    /// mempool, the bridge then asked for no transactions.
+    pub mempool: usize,
 }
 
 /// Validated heights between two progress lines while syncing.
@@ -90,6 +101,8 @@ const SHORT_LIVED: u64 = 60;
 const DISCOVER_EVERY: u64 = 600;
 /// Below this many addresses of ordinary peers, [`Node::discover`] asks the DNS seeds.
 const FEW_PEERS: usize = 32;
+/// The most transactions asked of the bridge and not here yet.
+const MAX_ASKED: usize = 5000;
 
 /// What the node needs to wait and to tell the time.
 #[allow(async_fn_in_trait)]
@@ -264,6 +277,12 @@ pub struct Status {
     /// Addresses in the book, and those of bridges among them.
     pub known: usize,
     pub known_bridges: usize,
+    /// What the mempool holds.
+    pub mempool: MempoolStats,
+    /// Transactions the mempool took, and those it refused (invalid, or checked against another
+    /// accumulator than ours, or below its lowest fee rate).
+    pub taken: u32,
+    pub refused: u32,
 }
 
 impl Status {
@@ -339,6 +358,12 @@ pub struct Node<S: ChainStore> {
     bridge_best: Cell<u32>,
     book: RefCell<AddrBook>,
     status: RefCell<Status>,
+    mempool: RefCell<Mempool>,
+    /// The transactions asked of the bridge, until they come, it has them no more, or the next
+    /// block.
+    asked: RefCell<BTreeSet<Txid>>,
+    /// The last transaction an `inv` announced, with the positions so far.
+    inv_tail: RefCell<Vec<Inventory>>,
 }
 
 impl<S: ChainStore> Node<S> {
@@ -347,6 +372,7 @@ impl<S: ChainStore> Node<S> {
     pub fn new(store: S, config: Config, nonce: u64) -> Result<Self, BlockchainError> {
         let chain = ChainState::open(store, config.network, AssumeValidArg::Disabled)?;
         let book = AddrBook::new(config.ipv6, nonce ^ 0x5eed);
+        let mempool = Mempool::new(config.mempool, nonce ^ 0x6d70_6f6f_6c00);
         Ok(Self {
             chain,
             config,
@@ -356,6 +382,9 @@ impl<S: ChainStore> Node<S> {
             bridge_best: Cell::new(u32::MAX),
             book: RefCell::new(book),
             status: RefCell::new(Status::default()),
+            mempool: RefCell::new(mempool),
+            asked: RefCell::new(BTreeSet::new()),
+            inv_tail: RefCell::new(Vec::new()),
         })
     }
 
@@ -373,7 +402,13 @@ impl<S: ChainStore> Node<S> {
         let book = self.book.borrow();
         status.known = book.len();
         status.known_bridges = book.count(Role::Bridge);
+        status.mempool = self.mempool.borrow().stats();
         status
+    }
+
+    /// The mempool.
+    pub fn mempool(&self) -> core::cell::Ref<'_, Mempool> {
+        self.mempool.borrow()
     }
 
     /// Adds a peer's address to the book: `Source::Configured` for the bridge to try first.
@@ -448,25 +483,39 @@ impl<S: ChainStore> Node<S> {
         self.status.borrow_mut().phase = phase;
     }
 
-    /// Exchanges `version` and `verack` with the peer, asking for `addrv2` (BIP 155). `now` is
-    /// the Unix time in seconds.
+    /// Exchanges `version` and `verack` with the peer, asking for `addrv2` (BIP 155), and for no
+    /// transactions. `now` is the Unix time in seconds.
     pub async fn handshake<T: Read + Write>(
         &self,
         conn: &mut Connection<T>,
         now: i64,
     ) -> Result<Version, Error<T::Error>> {
+        self.handshake_with(conn, now, false).await
+    }
+
+    /// The handshake, asking for the transactions (`relay`) as a Utreexo node does: announced
+    /// with the positions of the leaves they spend, relayed with their proofs (BIP 183).
+    async fn handshake_with<T: Read + Write>(
+        &self,
+        conn: &mut Connection<T>,
+        now: i64,
+        relay: bool,
+    ) -> Result<Version, Error<T::Error>> {
         let (height, _) = self.chain.get_best_block()?;
         conn.send(&Message::Version(Version {
             version: PROTOCOL_VERSION,
-            services: services::WITNESS,
+            services: if relay {
+                services::WITNESS | services::UTREEXO
+            } else {
+                services::WITNESS
+            },
             timestamp: now,
             receiver: NetAddress::default(),
             sender: NetAddress::default(),
             nonce: self.nonce,
             user_agent: self.config.user_agent.clone(),
             start_height: height as i32,
-            // no mempool yet: no transaction announcements
-            relay: false,
+            relay,
         }))
         .await?;
 
@@ -764,6 +813,10 @@ impl<S: ChainStore> Node<S> {
             |h| self.chain.get_mtp_by_height(h),
         )?;
         self.chain.connect_block(block, proof, inputs, del_hashes)?;
+        self.mempool.borrow_mut().block_connected(block);
+        // what was asked for or announced against the accumulator before this block
+        self.asked.borrow_mut().clear();
+        self.inv_tail.borrow_mut().clear();
         let mut status = self.status.borrow_mut();
         status.last_block = Some(BlockInfo {
             height,
@@ -800,7 +853,9 @@ impl<S: ChainStore> Node<S> {
         now: i64,
     ) -> Result<(), Error<T::Error>> {
         self.set_phase(Phase::Handshake);
-        let version = self.handshake(conn, now).await?;
+        let version = self
+            .handshake_with(conn, now, self.config.mempool > 0)
+            .await?;
         self.slot_ready(slot, Role::Bridge, addr, &version, conn.is_v2());
         info!(
             "bridge {}: {} height {} services {:#x}{}",
@@ -830,7 +885,15 @@ impl<S: ChainStore> Node<S> {
                 match select(conn.recv(), self.news.wait()).await {
                     Either::First(message) => match message? {
                         Message::Ping(nonce) => conn.send(&Message::Pong(nonce)).await?,
-                        message => self.note(&message),
+                        Message::UtreexoTx(utx) => self.take_transaction(utx),
+                        message => {
+                            self.note(&message);
+                            match &message {
+                                Message::Inv(list) => self.ask_transactions(conn, list).await?,
+                                Message::NotFound(list) => self.not_found(list),
+                                _ => {}
+                            }
+                        }
                     },
                     Either::Second(()) => {}
                 }
@@ -839,6 +902,127 @@ impl<S: ChainStore> Node<S> {
                 self.sync(conn).await?;
             }
         }
+    }
+
+    /// Asks the bridge for the transactions it announces in `list` that the mempool lacks, each
+    /// with the positions of the proof hashes that prove the leaves it spends: once synced, with
+    /// a mempool and the room for it. The last transaction of an `inv` waits for the next: its
+    /// positions may go on there (an `inv` holds a limited number of entries). Each transaction
+    /// is asked for once.
+    async fn ask_transactions<T: Read + Write>(
+        &self,
+        conn: &mut Connection<T>,
+        list: &[Inventory],
+    ) -> Result<(), Error<T::Error>> {
+        let mut entries = core::mem::take(&mut *self.inv_tail.borrow_mut());
+        if self.config.mempool == 0
+            || self.status.borrow().phase != Phase::Following
+            || !self.room_for_transactions()
+        {
+            return Ok(());
+        }
+        entries.extend_from_slice(list);
+        if let Some(last) = entries.iter().rposition(|e| e.tx().is_some()) {
+            *self.inv_tail.borrow_mut() = entries.split_off(last);
+        }
+        let wanted = self.wanted(&entries, self.chain.acc().leaves);
+        if !wanted.is_empty() {
+            conn.send(&Message::GetData(wanted)).await?;
+        }
+        Ok(())
+    }
+
+    /// The `getdata` entries for the transactions announced in `list` that the mempool lacks
+    /// and that were not asked for already, which it notes as asked for.
+    fn wanted(&self, list: &[Inventory], leaves: u64) -> Vec<Inventory> {
+        let mempool = self.mempool.borrow();
+        let mut asked = self.asked.borrow_mut();
+        let mut wanted = Vec::new();
+        let mut i = 0;
+        while i < list.len() {
+            let Some(txid) = list[i].tx() else {
+                i += 1;
+                continue;
+            };
+            // the positions of the leaves it spends follow it
+            let end = list[i + 1..]
+                .iter()
+                .position(|e| e.kind != inv::PROOF_POSITIONS)
+                .map_or(list.len(), |n| i + 1 + n);
+            if !mempool.contains(&txid) && asked.len() < MAX_ASKED && asked.insert(txid) {
+                let packed: Vec<[u8; 32]> = list[i + 1..end].iter().map(|e| e.hash).collect();
+                let targets = p2p::unpack_positions(&packed);
+                wanted.push(Inventory::utreexo_tx(txid));
+                let positions = proof_positions(&targets, leaves);
+                wanted.extend(
+                    p2p::pack_positions(&positions)
+                        .into_iter()
+                        .map(|hash| Inventory {
+                            kind: inv::PROOF_POSITIONS,
+                            hash,
+                        }),
+                );
+            }
+            i = end;
+        }
+        wanted
+    }
+
+    /// A transaction the bridge relays with its proof, into the mempool if it passes: one asked
+    /// for only, a transaction the bridge changed on its way having another txid (utreexod
+    /// 0.5.1 shifts the output indexes of its own copy each time it sends one).
+    fn take_transaction(&self, utx: UtreexoTx) {
+        if self.config.mempool == 0 || self.status.borrow().phase != Phase::Following {
+            return;
+        }
+        let txid = utx.tx.compute_txid();
+        if !self.asked.borrow_mut().remove(&txid) {
+            debug!("transaction {txid} not asked for");
+            self.status.borrow_mut().refused += 1;
+            return;
+        }
+        let result = self.mempool.borrow_mut().admit(utx, &self.chain);
+        let mut status = self.status.borrow_mut();
+        match result {
+            Ok(taken) => {
+                status.taken += taken.len() as u32;
+                debug!(
+                    "transaction {txid} into the mempool{}",
+                    if taken.len() > 1 {
+                        ", with orphans"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Err(Reject::Orphan(parents)) => {
+                debug!("transaction {txid} waits for {} parents", parents.len());
+            }
+            Err(Reject::Known) => {}
+            Err(e) => {
+                status.refused += 1;
+                debug!("transaction {txid} refused: {e:?}");
+            }
+        }
+    }
+
+    /// Transactions the bridge no longer has.
+    fn not_found(&self, list: &[Inventory]) {
+        let mut asked = self.asked.borrow_mut();
+        for txid in list.iter().filter_map(Inventory::tx) {
+            debug!("the bridge has no transaction {txid}");
+            asked.remove(&txid);
+        }
+    }
+
+    /// Whether the heap left takes more transactions: the reserve and a block's room, with a
+    /// free block of [`CONTIGUOUS_RESERVE`] at least. Yes when the heap left is not known.
+    fn room_for_transactions(&self) -> bool {
+        let Some(free_memory) = self.config.free_memory else {
+            return true;
+        };
+        let (free, largest) = free_memory();
+        free >= MEMORY_RESERVE + BLOCK_ROOM && largest >= CONTIGUOUS_RESERVE
     }
 
     /// An ordinary peer's connection: its headers checked and added to the header chain, the

@@ -76,6 +76,43 @@ pub mod inv {
     pub const BLOCK: u32 = 2;
     /// Asks for the witness serialization (BIP 144).
     pub const WITNESS_FLAG: u32 = 1 << 30;
+    /// Asks for the Utreexo data with it: a transaction as a `utreexotx` (BIP 183).
+    pub const UTREEXO_FLAG: u32 = 1 << 24;
+    /// Four positions in the accumulator packed in the hash, after a transaction's entry: in an
+    /// `inv`, of the leaves it spends; in a `getdata`, of the proof hashes asked for.
+    pub const PROOF_POSITIONS: u32 = 6;
+}
+
+/// Packs accumulator positions four to a hash, little-endian, the last hash padded with
+/// `u64::MAX` (the entries of kind [`inv::PROOF_POSITIONS`]).
+pub fn pack_positions(positions: &[u64]) -> Vec<[u8; 32]> {
+    positions
+        .chunks(4)
+        .map(|chunk| {
+            let mut hash = [0xff; 32];
+            for (i, p) in chunk.iter().enumerate() {
+                hash[8 * i..8 * i + 8].copy_from_slice(&p.to_le_bytes());
+            }
+            hash
+        })
+        .collect()
+}
+
+/// The positions packed by [`pack_positions`].
+pub fn unpack_positions(hashes: &[[u8; 32]]) -> Vec<u64> {
+    let mut positions = Vec::with_capacity(hashes.len() * 4);
+    for hash in hashes {
+        for i in 0..4 {
+            let mut bytes = [0; 8];
+            bytes.copy_from_slice(&hash[8 * i..8 * i + 8]);
+            let p = u64::from_le_bytes(bytes);
+            if p == u64::MAX {
+                break;
+            }
+            positions.push(p);
+        }
+    }
+    positions
 }
 
 /// An entry of `inv`, `getdata` and `notfound`.
@@ -86,6 +123,20 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    /// A transaction with its witnesses and its Utreexo data (a `utreexotx`).
+    pub fn utreexo_tx(txid: bitcoin::Txid) -> Self {
+        Self {
+            kind: inv::TX | inv::WITNESS_FLAG | inv::UTREEXO_FLAG,
+            hash: txid.to_byte_array(),
+        }
+    }
+
+    /// The txid of the transaction this entry names, if it names one.
+    pub fn tx(&self) -> Option<bitcoin::Txid> {
+        (self.kind & !(inv::WITNESS_FLAG | inv::UTREEXO_FLAG) == inv::TX)
+            .then(|| bitcoin::Txid::from_byte_array(self.hash))
+    }
+
     /// A block, with its witnesses.
     pub fn witness_block(hash: BlockHash) -> Self {
         Self {
@@ -202,6 +253,22 @@ pub struct UtreexoProof {
     pub leaf_data: Vec<CompactLeafData>,
 }
 
+/// BIP 183's `utreexotx`: a transaction with the Utreexo proof of the outputs it spends that are in
+/// the accumulator, and their data. On the wire each input's output index is shifted left, its low
+/// bit set when the output is unconfirmed (in a mempool, not the accumulator).
+#[derive(Clone, Debug)]
+pub struct UtreexoTx {
+    /// The transaction, its output indexes as they are.
+    pub tx: bitcoin::Transaction,
+    /// For each input, whether the output it spends is unconfirmed.
+    pub unconfirmed: Vec<bool>,
+    /// The positions in the forest of the leaves the confirmed inputs spend, in their order.
+    pub targets: Vec<u64>,
+    pub proof_hashes: Vec<BitcoinNodeHash>,
+    /// The outputs the confirmed inputs spend, in their order.
+    pub leaf_data: Vec<CompactLeafData>,
+}
+
 /// A message, decoded when the node uses it.
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -230,6 +297,8 @@ pub enum Message {
     SendAddrV2,
     /// Addresses of peers, in BIP 155's format.
     AddrV2(Vec<Address>),
+    /// A transaction with its Utreexo proof.
+    UtreexoTx(UtreexoTx),
     /// Any other message, not decoded.
     Other {
         command: [u8; 12],
@@ -265,6 +334,7 @@ const GETADDR: [u8; 12] = command("getaddr");
 const ADDR: [u8; 12] = command("addr");
 const SENDADDRV2: [u8; 12] = command("sendaddrv2");
 const ADDRV2: [u8; 12] = command("addrv2");
+const UTREEXOTX: [u8; 12] = command("utreexotx");
 
 impl Message {
     /// The command name, padded to 12 bytes.
@@ -286,6 +356,7 @@ impl Message {
             Self::Addr(_) => ADDR,
             Self::SendAddrV2 => SENDADDRV2,
             Self::AddrV2(_) => ADDRV2,
+            Self::UtreexoTx(_) => UTREEXOTX,
             Self::Other { command, .. } => *command,
         }
     }
@@ -386,6 +457,27 @@ impl Message {
                         }
                     }
                     out.extend_from_slice(&a.socket.port().to_be_bytes());
+                }
+            }
+            Self::UtreexoTx(utx) => {
+                put(&mut out, &VarInt(utx.targets.len() as u64));
+                for target in &utx.targets {
+                    put(&mut out, &VarInt(*target));
+                }
+                put(&mut out, &VarInt(utx.proof_hashes.len() as u64));
+                for hash in &utx.proof_hashes {
+                    out.extend_from_slice(&**hash);
+                }
+                let mut tx = utx.tx.clone();
+                for (input, unconfirmed) in tx.input.iter_mut().zip(&utx.unconfirmed) {
+                    input.previous_output.vout =
+                        input.previous_output.vout << 1 | *unconfirmed as u32;
+                }
+                put(&mut out, &tx);
+                for leaf in &utx.leaf_data {
+                    put(&mut out, &leaf.header_code);
+                    put(&mut out, &leaf.amount);
+                    put(&mut out, &leaf.spk_ty);
                 }
             }
             Self::Other { payload, .. } => out.extend_from_slice(payload),
@@ -498,6 +590,40 @@ impl Message {
                     block_hash,
                     proof_hashes,
                     targets,
+                    leaf_data,
+                })
+            }
+            UTREEXOTX => {
+                let n = get_len(r, MAX_INPUTS_PER_BLOCK)?;
+                let mut targets = Vec::with_capacity(n);
+                for _ in 0..n {
+                    targets.push(VarInt::consensus_decode(r)?.0);
+                }
+                let n = get_len(r, MAX_PROOF_HASHES)?;
+                let mut proof_hashes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    proof_hashes.push(BitcoinNodeHash::Some(<[u8; 32]>::consensus_decode(r)?));
+                }
+                let mut tx = bitcoin::Transaction::consensus_decode(r)?;
+                let mut unconfirmed = Vec::with_capacity(tx.input.len());
+                for input in &mut tx.input {
+                    unconfirmed.push(input.previous_output.vout & 1 == 1);
+                    input.previous_output.vout >>= 1;
+                }
+                let confirmed = unconfirmed.iter().filter(|u| !**u).count();
+                let mut leaf_data = Vec::with_capacity(confirmed);
+                for _ in 0..confirmed {
+                    leaf_data.push(CompactLeafData {
+                        header_code: u32::consensus_decode(r)?,
+                        amount: u64::consensus_decode(r)?,
+                        spk_ty: ScriptPubKeyKind::consensus_decode(r)?,
+                    });
+                }
+                Self::UtreexoTx(UtreexoTx {
+                    tx,
+                    unconfirmed,
+                    targets,
+                    proof_hashes,
                     leaf_data,
                 })
             }
@@ -644,7 +770,7 @@ const V2_COMMANDS: [&str; 28] = [
 ];
 
 /// The one-byte IDs Utreexo nodes give BIP 183's messages in the v2 transport, after BIP 324's.
-const V2_UTREEXO: [(u8, &str); 2] = [(29, "uproof"), (30, "getuproof")];
+const V2_UTREEXO: [(u8, &str); 3] = [(29, "uproof"), (30, "getuproof"), (34, "utreexotx")];
 
 /// The one-byte ID of `name` in the v2 transport, if it has one.
 fn v2_id(name: &[u8; 12]) -> Option<u8> {
@@ -1400,6 +1526,70 @@ mod tests {
         let (result, ()) = tokio::join!(ours.start_v2(Role::Initiator, random(3)), theirs);
         assert!(matches!(result, Err(Error::Closed)), "{result:?}");
         assert!(!ours.is_v2());
+    }
+
+    #[test]
+    fn positions_pack_four_to_a_hash_padded() {
+        let positions = [1, 300, 1 << 40, 7, 9];
+        let packed = pack_positions(&positions);
+        assert_eq!(packed.len(), 2);
+        assert_eq!(&packed[0][..8], &1u64.to_le_bytes());
+        assert_eq!(&packed[1][8..16], &[0xff; 8]);
+        assert_eq!(unpack_positions(&packed), positions);
+        assert!(pack_positions(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_utreexotx_marks_its_unconfirmed_inputs() {
+        use bitcoin::{transaction, Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let input = |vout| TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([7; 32]),
+                vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[[1u8; 72]]),
+        };
+        let utx = UtreexoTx {
+            tx: bitcoin::Transaction {
+                version: transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![input(3), input(0)],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            },
+            unconfirmed: vec![false, true],
+            targets: vec![42],
+            proof_hashes: vec![BitcoinNodeHash::Some([0xaa; 32])],
+            leaf_data: vec![CompactLeafData {
+                header_code: 100 << 1,
+                amount: 5000,
+                spk_ty: ScriptPubKeyKind::WitnessV0PubKeyHash,
+            }],
+        };
+        let encoded = Message::UtreexoTx(utx.clone()).encode();
+        // targets, hashes, then the transaction (version, segwit marker and flag, input count):
+        // its first input's index is 3 << 1, its second's (after txid, index, an empty script and
+        // the sequence) 0 << 1 | 1
+        let first = 1 + 1 + 1 + 32 + 4 + 2 + 1 + 32;
+        assert_eq!(&encoded[first..first + 4], &6u32.to_le_bytes());
+        let second = first + 4 + 1 + 4 + 32;
+        assert_eq!(&encoded[second..second + 4], &1u32.to_le_bytes());
+        match roundtrip(Message::UtreexoTx(utx.clone())) {
+            Message::UtreexoTx(got) => {
+                assert_eq!(got.tx, utx.tx);
+                assert_eq!(got.unconfirmed, utx.unconfirmed);
+                assert_eq!(got.targets, utx.targets);
+                assert_eq!(got.proof_hashes, utx.proof_hashes);
+                assert_eq!(got.leaf_data.len(), 1);
+                assert_eq!(got.leaf_data[0].amount, 5000);
+            }
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(v2_id(&command("utreexotx")), Some(34));
     }
 
     #[test]

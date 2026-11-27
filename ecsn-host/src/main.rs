@@ -75,6 +75,11 @@ struct Args {
     /// Fail the allocations that would take the heap beyond this many MiB, as a board's RAM does
     #[arg(long, value_name = "MIB")]
     heap_limit: Option<usize>,
+    /// With `--follow`: the most unconfirmed transactions the mempool holds, MB of their
+    /// serialized bytes (4 is a fair size); 0, the default, for no mempool. A utreexod 0.5.1
+    /// bridge changes its own copy of each transaction it relays this way (see the README)
+    #[arg(long, value_name = "MB", default_value_t = 0)]
+    mempool: usize,
 }
 
 /// TCP connections, given 10 s to open.
@@ -185,6 +190,11 @@ async fn main() -> ExitCode {
         v2_bridge: !args.v1,
         // the blocks in flight fit the heap left under the limit, as on a board
         free_memory: args.heap_limit.map(|_| heap_free as fn() -> (usize, usize)),
+        mempool: if args.follow {
+            args.mempool * 1_000_000
+        } else {
+            0
+        },
     };
 
     let Some(path) = &args.store else {
@@ -302,6 +312,19 @@ async fn follow<S: ChainStore>(args: &Args, node: &Node<S>, peer: &str) -> ExitC
                 "validated {validated} of {best}, {:?}; {} addresses ({} bridges);",
                 status.phase, status.known, status.known_bridges
             );
+            if node.config().mempool > 0 {
+                let m = status.mempool;
+                line += &format!(
+                    " mempool {} tx ({} kB, {} sat of fees, from {} sat/kvB), {} orphans, {} taken, {} refused;",
+                    m.transactions,
+                    m.bytes / 1000,
+                    m.fees,
+                    m.min_rate,
+                    m.orphans,
+                    status.taken,
+                    status.refused
+                );
+            }
             for p in &status.peers {
                 let role = match p.role {
                     Role::Bridge => "bridge",

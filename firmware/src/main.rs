@@ -18,6 +18,10 @@
 //! - `ECSN_BLOCKS_IN_FLIGHT`: blocks asked for at once while syncing, 2 by default: one validated
 //!   while the next comes (each is held in RAM until validated, a few megabytes on mainnet, and
 //!   fewer are asked for when the heap has not room for them);
+//! - `ECSN_MEMPOOL`: the most unconfirmed transactions the mempool holds once synced, MB of their
+//!   serialized bytes (about 2.5 times that of RAM; 4 is a fair size), none by default; the bridge
+//!   relays them with their Utreexo proofs, and none is asked for while the heap is short. A
+//!   utreexod 0.5.1 bridge changes its own copy of each transaction it relays this way;
 //! - `ECSN_LOG`: the most detailed log level of the node (`info` by default);
 //! - `ECSN_NTP`: the SNTP server, a name or an IPv4 address, `pool.ntp.org` by default.
 //!
@@ -116,6 +120,11 @@ const PEERS: usize = match option_env!("ECSN_PEERS") {
     Some(n) => parse_count(n),
     None => 2,
 };
+/// The most serialized bytes of unconfirmed transactions held.
+const MEMPOOL: usize = match option_env!("ECSN_MEMPOOL") {
+    Some(n) => parse_count(n) * 1_000_000,
+    None => 0,
+};
 /// The socket buffers of an ordinary peer: headers and addresses, a few kilobytes at a time.
 const PEER_RX: usize = 16 * 1024;
 const PEER_TX: usize = 4 * 1024;
@@ -203,12 +212,15 @@ const fn parse_count(s: &str) -> usize {
     let bytes = s.as_bytes();
     assert!(
         !bytes.is_empty() && bytes.len() <= 2,
-        "ECSN_PEERS: a number up to 99"
+        "ECSN_PEERS, ECSN_MEMPOOL: a number up to 99"
     );
     let mut n = 0;
     let mut i = 0;
     while i < bytes.len() {
-        assert!(bytes[i].is_ascii_digit(), "ECSN_PEERS: a number up to 99");
+        assert!(
+            bytes[i].is_ascii_digit(),
+            "ECSN_PEERS, ECSN_MEMPOOL: a number up to 99"
+        );
         n = n * 10 + (bytes[i] - b'0') as usize;
         i += 1;
     }
@@ -477,6 +489,7 @@ async fn main(spawner: Spawner) {
         v2: !V1,
         v2_bridge: !V1_BRIDGE && !V1,
         free_memory: Some(|| HEAP.free_and_largest()),
+        mempool: MEMPOOL,
     };
     let link = Link {
         stack,
@@ -905,6 +918,7 @@ async fn follow<S: ChainStore>(
                 capacity,
                 // `TlsfHeap::used` borrows the heap twice and panics
                 heap: (sdram::SIZE - HEAP.free(), sdram::SIZE),
+                mempool_cap: node.config().mempool,
             };
             screen
                 .draw(|ui: screen::Ui<'_>| gui::dashboard(ui, &view))

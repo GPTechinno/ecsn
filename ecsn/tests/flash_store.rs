@@ -27,6 +27,7 @@ fn config() -> Config {
         v2: true,
         v2_bridge: true,
         free_memory: None,
+        mempool: 0,
     }
 }
 
