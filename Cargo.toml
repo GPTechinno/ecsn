@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ecsn", "ecsn-host", "ecsn-regtest"]
+members = ["ecsn", "ecsn-host", "ecsn-regtest", "ecsn-mempool", "ecsn-replay"]
 # The firmware targets thumbv7em-none-eabihf with its own profile, runner and lockfile (see
 # firmware/.cargo/config.toml), so it is built from its own directory, outside of this host workspace.
 # ecsn-emu-disco builds with the nightly Rust of BLIT, its window (see ecsn-emu-disco/rust-toolchain.toml).

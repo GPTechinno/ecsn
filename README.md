@@ -17,6 +17,8 @@ BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
 | `ecsn` | `no_std`: the P2P messages (the v1 transport and BIP 324's v2, BIP 183's `getuproof`/`uproof`, BIP 155's `addrv2`), chain stores in RAM and on NOR flash, the address book and the DNS seeds, the node over any `embedded-io-async` stream: a bridge's connection (handshake, header sync, block validation, following new blocks) and ordinary peers' (headers, block announcements, addresses), each in a slot that reconnects to another address when it ends |
 | `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file |
 | `ecsn-regtest` | fills a regtest node with blocks spending outputs of earlier blocks and of their own |
+| `ecsn-mempool` | records the transactions and blocks the network relays, raw, with their time |
+| `ecsn-replay` | replays such a recording as a mempool on the board's heap (its TLSF allocator, 32-bit, 32 MiB), built for `wasm32-wasip1`, to measure how the heap gets cut up |
 | `ecsn-emu-disco` | the STM32H747I-DISCO emulated (`emulator/stm32h7-rax` with the board around it), to run and debug the firmware: a BLIT window or headless. Its own workspace, built from its directory with BLIT's nightly Rust |
 | `ecsn-firmware` (`firmware/`) | the node on an STM32H747I-DISCO (Cortex-M7): embassy, Ethernet with DHCP, the 32 MB SDRAM as the heap, the chain on the 128 MB QSPI flash. Its own workspace, built from its directory |
 
@@ -38,8 +40,9 @@ which took about 21 MB for some mainnet blocks and does not fit in the board's h
 
 ## Environment
 
-devenv (stable Rust, the `thumbv7em-none-eabihf` target, the ARM C compiler for
-`secp256k1-sys`, probe-rs), loaded by direnv, or `devenv shell -- <command>`.
+devenv (stable Rust, the `thumbv7em-none-eabihf` and `wasm32-wasip1` targets, the ARM C compiler
+and an unwrapped clang for `secp256k1-sys` on them, probe-rs, wasmtime), loaded by direnv, or
+`devenv shell -- <command>`.
 
 ```
 cargo test -p ecsn
@@ -99,6 +102,32 @@ does (its structures take more there, with 64-bit pointers), and fits the blocks
 
 `ecsn/tests/data/regtest-111.txt` is such a chain recorded from utreexod (blocks 1 to 111, block
 111's Utreexo data and the accumulator after it), which the tests validate and tamper with.
+
+## A mempool on the board's heap
+
+Before the mempool, a measurement: how the board's heap gets cut up by thousands of transactions
+coming and going beside the blocks. `ecsn-mempool` records what a node would keep, from a few
+peers of the DNS seeds asked to relay transactions (no validation): each transaction and block,
+raw, with its time. `ecsn-replay` replays a recording with every allocation in a TLSF allocator
+(rlsf, with the firmware's parameters) over a 32 MiB arena, 32-bit as the board (`wasm32-wasip1`
+under wasmtime): each transaction kept until a block confirms it or conflicts with it (or another
+spends the same output), the oldest leaving beyond the cap; each block's payload, decoded, held with
+a proof's room, then dropped. It prints the heap, its free bytes and its largest free block at each
+block and every 2,000 transactions, then a summary.
+
+```
+ecsn-mempool --network bitcoin --peers 3 --minutes 120 --out mainnet.rec
+cargo build -p ecsn-replay --release --target wasm32-wasip1
+wasmtime run --dir . target/wasm32-wasip1/release/ecsn-replay.wasm mainnet.rec 8   # cap, MiB
+wasmtime run --dir . target/wasm32-wasip1/release/ecsn-replay.wasm mainnet.rec 8 raw
+```
+
+`raw` keeps each transaction as its bytes with the outputs it spends instead of decoded. On two
+hours of mainnet (2026-11-27: 29,333 transactions, 16 MB, 7 blocks), from an empty mempool: no
+block's payload lacked a free block (the largest at least 11 MB at a 4 MiB cap, 8 to 12 % of the
+free bytes in smaller ones at each block), and the mempool took 2.2 to 2.9 bytes of heap a byte
+whether decoded or raw (raw saves 8 to 10 %): its indexes (by txid, by output spent, the arrival
+order) cost as much as its transactions.
 
 ## The flash chain store
 

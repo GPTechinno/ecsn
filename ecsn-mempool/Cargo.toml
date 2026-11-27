@@ -1,0 +1,17 @@
+[package]
+name = "ecsn-mempool"
+description = "Records the transactions and blocks the Bitcoin network relays, for a replay of a mempool on the board's heap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ecsn.workspace = true
+bitcoin = { workspace = true, features = ["std"] }
+floresta-chain = { workspace = true, features = ["std"] }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "sync"] }
+clap = { version = "4", features = ["derive"] }

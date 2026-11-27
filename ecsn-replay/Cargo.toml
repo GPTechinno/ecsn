@@ -1,0 +1,15 @@
+[package]
+name = "ecsn-replay"
+description = "Replays a recording of ecsn-mempool as a mempool on the board's heap (TLSF, 32-bit), to measure its fragmentation; built for wasm32-wasip1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bitcoin = { workspace = true, features = ["std"] }
+# the board's allocator: embedded-alloc's TLSF is rlsf's, with these parameters; `unstable` for
+# its list of blocks
+rlsf = { version = "0.2.3", features = ["unstable"] }
