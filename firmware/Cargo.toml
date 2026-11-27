@@ -67,6 +67,12 @@ opt-level = "s"
 [profile.release.package.chacha20-poly1305]
 opt-level = 3
 
+# the hashes: 3 % less time per block validated at 3 than at "s" (the accumulator's SHA-512, a
+# third of the core, stays as costly), for 760 bytes; rustreexo, floresta-chain and bitcoin at 3
+# would add 0.5 % for 21 kB
+[profile.release.package.bitcoin_hashes]
+opt-level = 3
+
 [patch.crates-io]
 # bitcoin_hashes 0.14.101 with the `sha256-extern` feature, and the bitcoin-io 0.1.101 beside it in
 # the same workspace (so that there is one `io::Write`): the `hashes-sha256-extern` branch of the
