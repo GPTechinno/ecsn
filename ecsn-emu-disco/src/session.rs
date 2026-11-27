@@ -2,11 +2,11 @@
 //! and what the window shows of it.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use stm32h7_rax::Event;
 use stm32h7_rax::devices::rcc::RESET_PIN;
@@ -49,6 +49,8 @@ pub struct Snapshot {
 pub enum Command {
     /// Resets the chip: the flash image is kept.
     Reset,
+    /// Writes every line logged since the start to a file (see [`log_file`]).
+    SaveLogs,
     Quit,
 }
 
@@ -118,6 +120,65 @@ fn log(snapshot: &mut Snapshot, line: String) {
     }
 }
 
+/// Where the logs of a run with the flash image `qspi` are saved at `now`: `logs/` beside the
+/// image (in the data directory for a run without one), named after the image and the UTC time,
+/// `mainnet-20261127-093512.log`.
+fn log_file(qspi: Option<&Path>, now: SystemTime) -> PathBuf {
+    let dir = qspi
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(crate::data_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = qspi
+        .and_then(Path::file_stem)
+        .map_or("volatile".into(), |s| s.to_string_lossy());
+    dir.join("logs")
+        .join(format!("{stem}-{}.log", utc_stamp(now)))
+}
+
+/// `now` as `YYYYMMDD-HHMMSS` in UTC.
+fn utc_stamp(now: SystemTime) -> String {
+    let secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (days, time) = ((secs / 86_400) as i64, secs % 86_400);
+    // the civil date of a day count since 1970-01-01 (Howard Hinnant's algorithm)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        time / 3600,
+        time / 60 % 60,
+        time % 60
+    )
+}
+
+/// Writes `lines` to [`log_file`]; returns the file.
+fn save_logs<'a>(
+    qspi: Option<&Path>,
+    lines: impl Iterator<Item = &'a String>,
+) -> std::io::Result<PathBuf> {
+    let path = log_file(qspi, SystemTime::now());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
 fn run(
     elf: Vec<u8>,
     qspi: Option<PathBuf>,
@@ -143,10 +204,19 @@ fn run(
     let mut shown = 0;
     let mut window = (Instant::now(), disco.now(), disco.instructions());
     let mut pending: Vec<String> = Vec::new();
+    // every line since the start, for SAVE LOGS (the window keeps the last LOG_LINES)
+    let mut history: Vec<String> = Vec::new();
     let mut stopped = None;
     loop {
         match inbox.try_recv() {
             Ok(Command::Quit) | Err(TryRecvError::Disconnected) => break,
+            Ok(Command::SaveLogs) => {
+                let line = match save_logs(qspi.as_deref(), history.iter().chain(&pending)) {
+                    Ok(path) => format!("emu: logs saved to {}", path.display()),
+                    Err(e) => format!("emu: logs not saved: {e}"),
+                };
+                pending.push(line);
+            }
             Ok(Command::Reset) => {
                 if let Err(e) = disco.save_qspi() {
                     eprintln!("ecsn-emu-disco: QSPI image: {e}");
@@ -184,6 +254,7 @@ fn run(
             last_frame = Instant::now();
             let mut s = shared.lock().unwrap();
             for line in pending.drain(..) {
+                history.push(line.clone());
                 log(&mut s, line);
             }
             let (wall, virt, instructions) = window;
@@ -222,6 +293,19 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_file_is_named_after_its_flash_image_and_the_utc_time() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_772_112);
+        assert_eq!(utc_stamp(at), "20261127-093512");
+        let leap = SystemTime::UNIX_EPOCH + Duration::from_secs(951_868_799);
+        assert_eq!(utc_stamp(leap), "20000229-235959");
+        assert_eq!(utc_stamp(SystemTime::UNIX_EPOCH), "19700101-000000");
+        assert_eq!(
+            log_file(Some(Path::new("/data/ecsn-emu-disco/mainnet.bin")), at),
+            PathBuf::from("/data/ecsn-emu-disco/logs/mainnet-20261127-093512.log")
+        );
+    }
 
     #[test]
     fn the_validated_height_follows_each_new_tip_and_the_progress() {

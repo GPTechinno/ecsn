@@ -2,7 +2,7 @@
 //! display shows in the display's place and its four user LEDs shining where
 //! they are lit (or the display alone at its size); under it what the LEDs
 //! mean, its network address, the chain's validated tip, the emulation's pace
-//! and the RESET button; the firmware's logs beside them, scrolled both ways.
+//! and the RESET and SAVE LOGS buttons; the firmware's logs beside them, scrolled both ways.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -261,6 +261,7 @@ impl Application for App {
         let mut root = ui.layout(flex::row().gap(GAP)).pad(GAP);
         root.insert(Rectangle::new().background(BACKGROUND));
         let reset;
+        let save_logs;
         let mut toggle = false;
 
         // The display on the board's photograph, or alone; then the board's
@@ -425,6 +426,7 @@ impl Application for App {
                 .build(|ui: Ui<'_>| text(ui, &format!("Validated up to: {validated}"), 14.0, TEXT));
             let mut buttons = state.child().layout(flex::row().gap(10.0));
             reset = buttons.child().build(|ui: Ui<'_>| button(ui, "RESET"));
+            save_logs = buttons.child().build(|ui: Ui<'_>| button(ui, "SAVE LOGS"));
             if self.photo.is_some() {
                 let label = if on_board { "DISPLAY 1:1" } else { "BOARD" };
                 toggle = buttons.child().build(|ui: Ui<'_>| button(ui, label));
@@ -568,8 +570,13 @@ impl Application for App {
                     (sideways.offset + 2.0 * swiped).clamp(0.0, sideways.maximum_offset());
             }
         }
-        if reset && let Some(session) = SESSION.lock().unwrap().as_ref() {
-            session.send(Command::Reset);
+        if let Some(session) = SESSION.lock().unwrap().as_ref() {
+            if reset {
+                session.send(Command::Reset);
+            }
+            if save_logs {
+                session.send(Command::SaveLogs);
+            }
         }
     }
 }

@@ -10,8 +10,12 @@ The window shows the board, from the photograph of its front on ST's product pag
 firmware's display shows in the display's place and its four user LEDs shining where they are lit;
 under it what the LEDs mean (LD1 blinks while the firmware runs, LD2 is on while connected to the
 peer, LD3 and LD4 are not used), the board's address, the validated tip, the emulation's pace,
-RESET and DISPLAY 1:1 (the display alone, at its size); beside them the firmware's defmt logs,
-scrolled sideways by the bar under them, a sideways scroll, or Shift and the wheel.
+RESET, SAVE LOGS and DISPLAY 1:1 (the display alone, at its size); beside them the firmware's defmt
+logs, scrolled sideways by the bar under them, a sideways scroll, or Shift and the wheel. The window
+keeps the last 5000 lines; SAVE LOGS writes every line since the start (the firmware's, the
+emulator's and the network's notes) to `logs/<image>-<UTC time>.log` beside the flash image
+(`logs/mainnet-20261127-093512.log`; `volatile-…` in the data directory for a run without an image)
+and says where in the logs.
 
 ## The board
 

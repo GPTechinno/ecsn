@@ -117,17 +117,23 @@ fn firmware_network(elf: &[u8]) -> Option<&'static str> {
     })
 }
 
-/// Where the QSPI flash image is kept between runs, when `--qspi` names none: one per network, so
-/// that a firmware for one network does not format the store of another.
-fn default_qspi(network: Option<&str>) -> Option<PathBuf> {
+/// The emulator's directory for what it keeps between runs: `$XDG_DATA_HOME/ecsn-emu-disco`, or
+/// `~/.local/share/ecsn-emu-disco`.
+pub fn data_dir() -> Option<PathBuf> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
         })?;
+    Some(data.join("ecsn-emu-disco"))
+}
+
+/// Where the QSPI flash image is kept between runs, when `--qspi` names none: one per network, so
+/// that a firmware for one network does not format the store of another.
+fn default_qspi(network: Option<&str>) -> Option<PathBuf> {
     let file = format!("{}.bin", network.unwrap_or("qspi"));
-    Some(data.join("ecsn-emu-disco").join(file))
+    Some(data_dir()?.join(file))
 }
 
 fn main() -> ExitCode {
