@@ -164,6 +164,14 @@ impl Layout {
         })
     }
 
+    /// The erase blocks after the last record, which the store never uses: `(start, length)`,
+    /// none if the records reach the last block. A flash of 128 MB has one of 8 KB.
+    pub fn spare(&self) -> Option<(u32, u32)> {
+        let end = self.records_at as u64 + self.records as u64 * RECORD_SIZE as u64;
+        let start = end.div_ceil(self.erase_size as u64) * self.erase_size as u64;
+        (start < self.capacity as u64).then(|| (start as u32, self.capacity - start as u32))
+    }
+
     fn fields(&self) -> [u32; 11] {
         [
             self.erase_size,
@@ -221,7 +229,7 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
 }
 
 /// CRC-32 (IEEE) of the concatenation of `parts`.
-fn crc32(parts: &[&[u8]]) -> u32 {
+pub(crate) fn crc32(parts: &[&[u8]]) -> u32 {
     let mut crc = !0u32;
     for part in parts {
         for &byte in *part {

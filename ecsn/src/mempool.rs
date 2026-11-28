@@ -1,8 +1,8 @@
 //! The mempool: unconfirmed transactions relayed with their Utreexo proofs (BIP 183's
 //! `utreexotx`), each checked when it comes against the accumulator of the validated tip: its
 //! proof, the outputs it spends (in the accumulator, or of transactions held), its amounts, the
-//! maturity of the coinbase outputs it spends, its lock times. Scripts are not checked, as for
-//! blocks.
+//! maturity of the coinbase outputs it spends, its lock times, and its scripts when it is given a
+//! script interpreter ([`Mempool::check_scripts`]).
 //!
 //! A transaction checked stays valid until a block confirms it or spends one of the outputs it
 //! spends, which the block's inputs tell, so its proof is not kept. A block that does not follow
@@ -20,7 +20,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use bitcoin::hashes::{siphash24, Hash};
-use bitcoin::{absolute, transaction, Block, BlockHash, OutPoint, Transaction, Txid};
+use bitcoin::{absolute, transaction, Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use floresta_chain::proof_util::process_proof;
 use floresta_chain::pruned_utreexo::consensus::{Consensus, LockTimeCutoff};
 use floresta_chain::{BlockchainError, BlockchainInterface, ChainState, ChainStore, UtxoData};
@@ -28,6 +28,7 @@ use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
 
 use crate::p2p::UtreexoTx;
+use crate::scripts::{self, ScriptRules, VerifyScripts};
 
 /// Why a transaction was not taken.
 #[derive(Debug)]
@@ -46,6 +47,8 @@ pub enum Reject {
     Orphan(Vec<Txid>),
     /// Its absolute lock time is not reached for the next block.
     NotFinal,
+    /// The script of this input fails.
+    Script(usize),
     /// It spends an output a transaction held spends, without paying more than it (and what
     /// spends from it) in all and per vbyte.
     Conflict,
@@ -110,6 +113,8 @@ pub struct Mempool {
     orphans: BTreeMap<u64, (Txid, UtreexoTx, usize)>,
     orphan_bytes: usize,
     arrivals: u64,
+    /// The script interpreter and when each rule applies, if scripts are checked.
+    scripts: Option<(VerifyScripts, ScriptRules)>,
 }
 
 impl Mempool {
@@ -128,7 +133,14 @@ impl Mempool {
             orphans: BTreeMap::new(),
             orphan_bytes: 0,
             arrivals: 0,
+            scripts: None,
         }
+    }
+
+    /// Checks the scripts of the transactions it takes with `verify`, under the flags of the
+    /// next block.
+    pub fn check_scripts(&mut self, verify: VerifyScripts, rules: ScriptRules) {
+        self.scripts = Some((verify, rules));
     }
 
     fn short(&self, bytes: &[u8]) -> u64 {
@@ -317,6 +329,14 @@ impl Mempool {
             );
         }
 
+        // the outputs it spends in the order of its inputs, for its scripts
+        let spent: Option<Vec<TxOut>> = self.scripts.as_ref().and_then(|_| {
+            tx.input
+                .iter()
+                .map(|input| utxos.get(&input.previous_output).map(|u| u.txout.clone()))
+                .collect()
+        });
+
         // the transaction against them, for the next block
         let (in_value, out_value) = Consensus::verify_transaction(
             &tx,
@@ -329,7 +349,18 @@ impl Mempool {
         if !is_final(&tx, height, mtp) {
             return Err(Reject::NotFinal);
         }
+        // the scripts last, the costliest
+        if let (Some((verify, rules)), Some(spent)) = (&self.scripts, &spent) {
+            scripts::check(*verify, &tx, spent, rules.flags(height, None))
+                .map_err(Reject::Script)?;
+        }
         let fee = (in_value - out_value).to_sat();
+        self.hold(tx, txid, id, fee)
+    }
+
+    /// Holds `tx`, checked, which pays `fee`: in place of the transactions it conflicts with if
+    /// it pays more, then under the cap.
+    fn hold(&mut self, tx: Transaction, txid: Txid, id: u64, fee: u64) -> Result<Txid, Reject> {
         let vsize = tx.vsize() as u64;
         let size = tx.total_size();
         let rate = fee * 1000 / vsize.max(1);
@@ -385,6 +416,19 @@ impl Mempool {
         Ok(txid)
     }
 
+    /// Holds `tx` as if it had passed admission, paying `fee`: for measurements of the mempool's
+    /// memory (`ecsn-replay`), which have the transactions without what they spend.
+    #[cfg(feature = "unchecked")]
+    #[doc(hidden)]
+    pub fn hold_unchecked(&mut self, tx: Transaction, fee: u64) -> Result<Txid, Reject> {
+        let txid = tx.compute_txid();
+        let id = self.short_txid(&txid);
+        if self.txs.contains_key(&id) {
+            return Err(Reject::Known);
+        }
+        self.hold(tx, txid, id, fee)
+    }
+
     /// Keeps `utx` aside until the transactions it spends from come, if it is not already.
     fn keep_orphan(&mut self, txid: Txid, utx: UtreexoTx) {
         if self.orphans.values().any(|(t, _, _)| *t == txid) {
@@ -412,7 +456,10 @@ impl Mempool {
     pub fn block_connected(&mut self, block: &Block) {
         self.orphans.clear();
         self.orphan_bytes = 0;
-        let follows = self.tip == Some(block.header.prev_blockhash);
+        // a mempool that has not seen a tip yet has checked nothing against one
+        let follows = self
+            .tip
+            .is_none_or(|tip| tip == block.header.prev_blockhash);
         self.tip = Some(block.block_hash());
         if self.txs.is_empty() {
             return;
@@ -631,41 +678,74 @@ mod tests {
         }
     }
 
-    /// The same with leaves moved up the forest by deletions: targets above the bottom row.
+    /// The same, hash for hash, in forests that deletions cut up (leaves moved up several rows):
+    /// the hashes at the positions, taken from the forest, are rustreexo's proof, in order.
     #[test]
-    fn proof_positions_match_rustreexo_after_deletions() {
+    fn proof_positions_are_rustreexos_after_deletions() {
         use rustreexo::mem_forest::MemForest;
-        let mut forest = MemForest::new();
-        let hashes: Vec<_> = (0..64u8).map(hash).collect();
-        forest.modify(&hashes, &[]).unwrap();
-        let deleted: Vec<_> = (0..64u8)
-            .filter(|i| i % 3 == 0 || i % 7 == 1)
-            .map(hash)
-            .collect();
-        forest.modify(&[], &deleted).unwrap();
-        let more: Vec<_> = (64..90u8).map(hash).collect();
-        forest.modify(&more, &[]).unwrap();
-        let leaves = 64 + 26;
-        let left: Vec<_> = (0..90u8)
-            .filter(|i| *i >= 64 || !(i % 3 == 0 || i % 7 == 1))
-            .collect();
-        for set in [
-            left.iter().step_by(5).copied().collect::<Vec<_>>(),
-            left.iter().rev().step_by(4).copied().collect(),
-            left.clone(),
-        ] {
-            let wanted: Vec<_> = set.iter().map(|i| hash(*i)).collect();
+        let hash = |i: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            bytes[4] = 1;
+            BitcoinNodeHash::Some(bytes)
+        };
+        // a small xorshift for the choices
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20u32 {
+            let mut forest = MemForest::new();
+            let mut alive = Vec::new();
+            let mut added = 0u32;
+            // blocks of additions and deletions
+            for _ in 0..(3 + round % 5) {
+                let add: Vec<_> = (0..(50 + next() % 400) as u32)
+                    .map(|i| hash(added + i))
+                    .collect();
+                added += add.len() as u32;
+                let mut del = Vec::new();
+                alive.retain(|h| {
+                    if next() % 3 == 0 {
+                        del.push(*h);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                forest.modify(&add, &del).unwrap();
+                alive.extend(add);
+            }
+            let leaves = u64::from(added);
+            let wanted: Vec<_> = alive
+                .iter()
+                .filter(|_| next() % (1 + round as u64 % 7 * 5) == 0)
+                .take(200)
+                .copied()
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
             let proof = forest.prove(&wanted).unwrap();
-            assert!(
-                proof.targets.iter().any(|t| *t >= 1 << 63),
-                "a target above row 0"
-            );
-            assert_eq!(
-                proof_positions(&proof.targets, leaves).len(),
-                proof.hashes.len(),
-                "targets {:?}",
-                proof.targets
-            );
+            let positions = proof_positions(&proof.targets, leaves);
+            let rows = tree_rows(leaves);
+            let hashes: Vec<_> = positions
+                .iter()
+                .map(|p| {
+                    forest
+                        .grab_node(translate(*p, WIRE_ROWS, rows))
+                        .unwrap()
+                        .0
+                        .get_data()
+                })
+                .collect();
+            assert_eq!(hashes, proof.hashes, "round {round}");
+            assert!(forest
+                .verify(&Proof::new(proof.targets.clone(), hashes), &wanted)
+                .unwrap());
         }
     }
 

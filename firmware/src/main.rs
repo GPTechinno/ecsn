@@ -47,6 +47,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "scripts")]
+mod cxx;
 mod display;
 mod gui;
 mod heap;
@@ -402,6 +404,11 @@ async fn main(spawner: Spawner) {
     }
     unsafe { HEAP.init(sdram::BASE, sdram::SIZE) };
     info!("SDRAM: {=usize} MB of heap", sdram::SIZE >> 20);
+    // SAFETY: once, the heap ready, before the script interpreter runs
+    #[cfg(feature = "scripts")]
+    unsafe {
+        cxx::run_constructors()
+    };
     log::init();
 
     let mut screen = match Display::new(
@@ -490,6 +497,10 @@ async fn main(spawner: Spawner) {
         v2_bridge: !V1_BRIDGE && !V1,
         free_memory: Some(|| HEAP.free_and_largest()),
         mempool: MEMPOOL,
+        #[cfg(feature = "scripts")]
+        verify_scripts: Some(ecsn_consensus::verify_scripts),
+        #[cfg(not(feature = "scripts"))]
+        verify_scripts: None,
     };
     let link = Link {
         stack,
@@ -503,13 +514,14 @@ async fn main(spawner: Spawner) {
     };
     if RAM_STORE {
         info!("chain store: RAM");
-        follow(MemChainStore::new(), None, config, link, screen).await
+        follow(MemChainStore::new(), None, None, config, link, screen).await
     }
 
+    static QSPI: StaticCell<RefCell<qspi::QspiFlash>> = StaticCell::new();
     let flash = match qspi::QspiFlash::new(
         p.QUADSPI, p.PB2, p.PG6, p.PD11, p.PF9, p.PF7, p.PF6, p.PH2, p.PH3, p.PG9, p.PG14,
     ) {
-        Ok(flash) => flash,
+        Ok(flash) => qspi::SharedFlash(QSPI.init(RefCell::new(flash))),
         Err(e) => defmt::panic!("QSPI flash: {}", e),
     };
     info!("QSPI flash: mounting the chain store (formatting a flash without one takes minutes)");
@@ -548,8 +560,26 @@ async fn main(spawner: Spawner) {
         Err(e) => defmt::panic!("QSPI flash: {}", Debug2Format(&e)),
     };
     let capacity = store.layout().records;
-    follow(store, Some(capacity), config, link, screen).await
+    // the address book in the erase blocks the store leaves after its records
+    let book = store
+        .layout()
+        .spare()
+        .map(|(at, len)| Book { flash, at, len });
+    if book.is_none() {
+        warn!("QSPI flash: no room for the address book, not saved");
+    }
+    follow(store, Some(capacity), book, config, link, screen).await
 }
+
+/// Where the address book is saved: erase blocks of the QSPI flash the chain store leaves.
+struct Book {
+    flash: qspi::SharedFlash,
+    at: u32,
+    len: u32,
+}
+
+/// How often the address book is saved, when it changed: an erase of its block each time.
+const BOOK_EVERY: Duration = Duration::from_secs(1800);
 
 /// The network side of the node: the stack, the peer, what the `version` message needs, the
 /// first SNTP cookie, LD2, and the watchdog the guard arms.
@@ -734,6 +764,7 @@ async fn ask_time(stack: Stack<'static>, cookie: u64) -> Result<(i64, Instant), 
 async fn follow<S: ChainStore>(
     store: S,
     capacity: Option<u32>,
+    mut book: Option<Book>,
     config: Config,
     link: Link,
     screen: Option<Screen>,
@@ -754,6 +785,12 @@ async fn follow<S: ChainStore>(
         Ok(node) => node,
         Err(e) => defmt::panic!("chain: {}", Debug2Format(&e)),
     };
+    if let Some(b) = &book {
+        if let Some(saved) = ecsn::flash::load_record(&b.flash, b.at, b.len) {
+            let added = node.load_book(&saved);
+            info!("address book: {=usize} addresses from the flash", added);
+        }
+    }
     node.add_address(SocketAddr::V4(peer), 0, Source::Configured);
     let clock = BoardClock {
         wall: &wall,
@@ -825,8 +862,21 @@ async fn follow<S: ChainStore>(
         let mut heap_peak = 0;
         let mut smallest_largest = usize::MAX;
         let mut last = Instant::now();
+        let mut book_saved = (node.book_changes(), Instant::now());
         loop {
             Timer::after(GUARD_PERIOD).await;
+            // the address book, every half hour if it changed
+            if let Some(b) = &mut book {
+                let changes = node.book_changes();
+                if changes != book_saved.0 && book_saved.1.elapsed() >= BOOK_EVERY {
+                    let bytes = node.book_bytes(b.len as usize - 16);
+                    match ecsn::flash::save_record(&mut b.flash, b.at, b.len, &bytes) {
+                        Ok(_) => info!("address book: saved, {=usize} bytes", bytes.len()),
+                        Err(e) => warn!("address book: not saved: {}", e),
+                    }
+                    book_saved = (changes, Instant::now());
+                }
+            }
             let now = Instant::now();
             let stall = (now - last)
                 .checked_sub(GUARD_PERIOD)

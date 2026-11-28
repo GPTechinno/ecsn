@@ -202,6 +202,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoinconsensus"
+version = "0.106.0+26.0"
+source = "git+https://github.com/GPTechinno/rust-bitcoinconsensus?branch=verify-transaction#70851f1dfcf53b6a21d0e8130da10ba35ea4ee85"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "bitfield"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -509,6 +517,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecsn-consensus"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "bitcoinconsensus",
+]
+
+[[package]]
 name = "ecsn-firmware"
 version = "0.1.0"
 dependencies = [
@@ -526,6 +542,7 @@ dependencies = [
  "defmt 1.2.0",
  "defmt-rtt",
  "ecsn",
+ "ecsn-consensus",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",

@@ -1,0 +1,14 @@
+[package]
+name = "ecsn-consensus"
+description = "The scripts of a transaction checked by Bitcoin Core's script interpreter (libbitcoinconsensus), for ecsn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+# Bitcoin Core 26.0's libbitcoinconsensus, C++ built by `cc`: its own libsecp256k1, or an
+# external one with `external-secp` (the firmware's)
+bitcoinconsensus = { version = "0.106.0", default-features = false }

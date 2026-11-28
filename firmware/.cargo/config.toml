@@ -12,3 +12,6 @@ target = "thumbv7em-none-eabihf"
 
 [env]
 DEFMT_LOG = "info"
+# the script interpreter's signature tables (the `scripts` feature): 8 KiB at a window of 8, where
+# the default 15 takes 1 MiB of flash
+BITCOINCONSENSUS_ECMULT_WINDOW_SIZE = "8"

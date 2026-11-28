@@ -434,3 +434,30 @@ impl Flash for QspiFlash {
         result
     }
 }
+
+/// The QSPI flash shared between the chain store and the saved address book: borrowed for each
+/// access, which never overlaps another (the store's are synchronous, in one task).
+#[derive(Clone, Copy)]
+pub struct SharedFlash(pub &'static core::cell::RefCell<QspiFlash>);
+
+impl Flash for SharedFlash {
+    type Error = Error;
+    const ERASE_SIZE: u32 = QspiFlash::ERASE_SIZE;
+    const WRITE_SIZE: u32 = QspiFlash::WRITE_SIZE;
+
+    fn capacity(&self) -> u32 {
+        self.0.borrow().capacity()
+    }
+
+    fn read(&self, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        self.0.borrow().read(offset, buf)
+    }
+
+    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), Error> {
+        self.0.borrow_mut().write(offset, data)
+    }
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Error> {
+        self.0.borrow_mut().erase(from, to)
+    }
+}

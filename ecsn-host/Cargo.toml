@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 ecsn.workspace = true
+ecsn-consensus = { path = "../ecsn-consensus" }
 bitcoin = { workspace = true, features = ["std"] }
 floresta-chain = { workspace = true, features = ["std"] }
 rustreexo = { workspace = true, features = ["std"] }

@@ -31,6 +31,7 @@ fn node() -> Node<MemChainStore> {
         v2_bridge: true,
         free_memory: None,
         mempool: 0,
+        verify_scripts: None,
     };
     Node::new(MemChainStore::new(), config, 0).unwrap()
 }
@@ -452,4 +453,100 @@ fn the_bridge_slot_falls_back_to_v1_when_v2_fails() {
     );
     assert!(!bridge.v2);
     assert_eq!(streams, 2);
+}
+
+/// A bridge with the headers up to 111 but the blocks up to 110 only: `notfound` for block 111.
+/// In v2, as the configured peer is tried first.
+async fn bridge_without_111(io: DuplexStream, fixture: &Fixture) {
+    let mut conn = Connection::new(FromTokio::new(io), Network::Regtest);
+    if conn
+        .start_v2(bip324::Role::Responder, [7; 64])
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let missing = fixture.blocks[110].block_hash();
+    while let Ok(message) = conn.recv().await {
+        let answers = match message {
+            Message::Version(_) => vec![version("/behind/", BRIDGE, 111), Message::Verack],
+            Message::GetHeaders { .. } => vec![headers(fixture, 111)],
+            Message::GetData(list) => {
+                let (gone, have): (Vec<_>, Vec<_>) = list
+                    .into_iter()
+                    .partition(|inv| inv.block() == Some(missing));
+                let mut answers = blocks(fixture, &have);
+                if !gone.is_empty() {
+                    answers.push(Message::NotFound(gone));
+                }
+                answers
+            }
+            _ => Vec::new(),
+        };
+        for answer in &answers {
+            if conn.send(answer).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// A clock on tokio's time, which a paused runtime advances at once when all wait.
+struct PausedClock(tokio::time::Instant);
+
+impl Clock for PausedClock {
+    fn now(&self) -> u64 {
+        self.0.elapsed().as_secs()
+    }
+
+    fn unix(&self) -> i64 {
+        0
+    }
+
+    async fn sleep(&self, seconds: u64) {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
+}
+
+#[test]
+fn a_bridge_without_the_blocks_of_the_best_chain_is_left() {
+    let fixture = fixture();
+    let node = node();
+    let addr: SocketAddr = "10.0.2.2:18444".parse().unwrap();
+    assert!(node.add_address(addr, 0, Source::Configured));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let (left_after, connected) = runtime.block_on(async {
+        let start = tokio::time::Instant::now();
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let mut dialer = OneStream(Some(ours));
+        let clock = PausedClock(start);
+        let slot = node.run_slot(0, Role::Bridge, &mut dialer, &clock);
+        let connected = std::cell::Cell::new(false);
+        let watch = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let bridge = node.status().bridge().is_some_and(|b| b.info.is_some());
+                if bridge {
+                    connected.set(true);
+                } else if connected.get() {
+                    return start.elapsed();
+                }
+            }
+        };
+        tokio::select! {
+            _ = async { tokio::join!(slot, bridge_without_111(theirs, &fixture)) } => unreachable!(),
+            left = watch => (left, connected.get()),
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => panic!("the bridge was kept an hour: validated {} best {} phase {:?}", node.chain().get_validation_index().unwrap(), node.chain().get_best_block().unwrap().0, node.status().phase),
+        }
+    });
+    assert!(connected);
+    assert_eq!(node.chain().get_validation_index().unwrap(), 110);
+    assert_eq!(node.chain().get_best_block().unwrap().0, 111);
+    // left after 20 minutes without a block, not before
+    assert!(left_after >= Duration::from_secs(1200), "{left_after:?}");
+    assert!(left_after < Duration::from_secs(1400), "{left_after:?}");
 }

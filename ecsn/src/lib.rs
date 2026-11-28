@@ -8,6 +8,8 @@
 //! - [`node`]: the connections to a bridge and to ordinary peers, the header sync and the
 //!   validation of each block with its Utreexo proof.
 //! - [`mempool`]: unconfirmed transactions with their Utreexo proofs, checked as they come.
+//! - [`scripts`]: the flags of the script interpreter, and the checks of a transaction's scripts
+//!   by the function the node is given.
 //! - [`sntp`]: the time of day from an SNTP server, for a board with no clock.
 
 #![no_std]
@@ -19,5 +21,6 @@ pub mod flash;
 pub mod mempool;
 pub mod node;
 pub mod p2p;
+pub mod scripts;
 pub mod sntp;
 pub mod store;

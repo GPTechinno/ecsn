@@ -8,14 +8,17 @@ with external SDRAM. The node runs on a computer, and is being brought up on an 
 The node keeps the Utreexo accumulator (a few kilobytes) instead of the UTXO set. It downloads
 headers, then each block with the Utreexo proof of the outputs it spends, from a peer serving
 BIP 183 proofs (utreexod with a proof index, or Floresta), and validates it with
-`floresta-chain`. Scripts are not checked yet (`floresta-chain` without `bitcoinkernel`).
+`floresta-chain`, and its scripts with Bitcoin Core's script interpreter (`ecsn-consensus`) when
+the node is given it: on a computer by default, on the board with the firmware's `scripts`
+feature.
 
 ## Crates
 
 | Crate | |
 |---|---|
 | `ecsn` | `no_std`: the P2P messages (the v1 transport and BIP 324's v2, BIP 183's `getuproof`/`uproof`/`utreexotx`, BIP 155's `addrv2`), chain stores in RAM and on NOR flash, the address book and the DNS seeds, a mempool of transactions checked with their Utreexo proofs, the node over any `embedded-io-async` stream: a bridge's connection (handshake, header sync, block validation, following new blocks, the transactions it relays) and ordinary peers' (headers, block announcements, addresses), each in a slot that reconnects to another address when it ends |
-| `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file |
+| `ecsn-consensus` | the scripts of a transaction checked by Bitcoin Core 26.0's script interpreter (libbitcoinconsensus, C++, every input in one call), the function the node takes; `no_std`, for the host and the firmware |
+| `ecsn-host` | the node over TCP on a computer (tokio), its chain in RAM or in a flash image file, scripts checked (`--no-scripts`), its address book in a file (`--book`) |
 | `ecsn-regtest` | fills a regtest node with blocks spending outputs of earlier blocks and of their own |
 | `ecsn-mempool` | records the transactions and blocks the network relays, raw, with their time |
 | `ecsn-replay` | replays such a recording as a mempool on the board's heap (its TLSF allocator, 32-bit, 32 MiB), built for `wasm32-wasip1`, to measure how the heap gets cut up |
@@ -37,6 +40,35 @@ The workspace and the firmware take `rustreexo` 0.7.0 from the `proof-memory` br
 [GPTechinno/rustreexo](https://github.com/GPTechinno/rustreexo) (a `[patch]`): it checks a proof
 without copying its hashes into a sorted list nor reserving room for twice as many computed nodes,
 which took about 21 MB for some mainnet blocks and does not fit in the board's heap.
+
+`ecsn-consensus` takes `bitcoinconsensus` (rust-bitcoinconsensus, Bitcoin Core 26.0's
+libbitcoinconsensus) from the `verify-transaction` branch of the fork
+[GPTechinno/rust-bitcoinconsensus](https://github.com/GPTechinno/rust-bitcoinconsensus) (a
+`[patch]`): `verify_transaction` checks every input of a transaction in one call
+(the transaction deserialized and its signature hashes' shared data computed once, where the
+library's per-input calls redo both for each input: a transaction of 740 inputs in 28 ms instead of
+605 ms on a computer), the crate builds without `std`, for `arm-none-eabi` (newlib's `int32_t`), and
+with a smaller table of signature verification (`BITCOINCONSENSUS_ECMULT_WINDOW_SIZE`, 8 for the
+firmware: 8 KiB instead of 1 MiB). Building it needs a C++ compiler: the host's, and
+`arm-none-eabi-g++` for the firmware (the devenv's `CXX_thumbv7em_none_eabihf`).
+
+## Scripts
+
+A block's scripts are checked after its Utreexo proof (which gives the outputs it spends, those
+of its own transactions taken from them) and before it is connected; a mempool transaction's after
+its amounts. The flags follow the chain's soft forks as Bitcoin Core's: P2SH, segwit and Taproot
+from the genesis block but in the two mainnet blocks that break them, DERSIG, CHECKLOCKTIMEVERIFY,
+CHECKSEQUENCEVERIFY and NULLDUMMY from their heights (`ecsn::scripts::ScriptRules`).
+
+The firmware checks them with its `scripts` feature (`cargo build --release --features scripts`
+from `firmware/`). It links Arm's C++ runtime (libstdc++ and libsupc++ nano, newlib nano, libgcc:
+`arm-none-eabi-g++`'s multilib for the Cortex-M7 with its FPU), serves `malloc` from the heap, runs
+the C++ static constructors at the start (the Taproot hashers among them; cortex-m-rt runs none),
+and keeps the exception tables the interpreter unwinds with: a copy of cortex-m-rt's `link.x`
+without its discard of them (`link-cxx.x`), `cxx.x` placing them, and PC-relative type references
+in them (`--target2=rel`). The firmware then takes 1.1 MB of flash: both banks (`memory.x.in`, 2 MB
+with the feature), the Cortex-M4's bank 2 included, which on a real DISCO means keeping the M4 from
+booting (its option bytes).
 
 ## Environment
 
@@ -107,9 +139,9 @@ does (its structures take more there, with 64-bit pointers), and fits the blocks
 
 Once synced, the node asks the bridge for its transactions (`relay` and `NODE_UTREEXO` in its
 `version`, toward the bridge only). As utreexod does for a Utreexo peer, the bridge announces each
-transaction with the positions in the accumulator of the leaves it spends (in the same `inv`, or
-going on in the next one); the node asks for it as a `utreexotx` with the positions of the proof
-hashes it needs (it caches none), once, and checks what comes against the accumulator of its
+transaction with the positions in the accumulator of the leaves it spends; the node asks for it
+as a `utreexotx` with the positions of the proof hashes it needs (it caches none), once, and
+checks what comes against the accumulator of its
 validated tip (`ecsn::mempool`): the proof, the outputs spent (in the accumulator, or of
 transactions it holds), the amounts, the maturity of the coinbase outputs spent, the lock times;
 not the scripts, as for blocks. The proof is then dropped: a transaction stays valid until a block
@@ -281,10 +313,17 @@ ends a headless run as `--seconds` does: the statistics, the profile, the QSPI i
 - Blocks pipelined: windows of 1 and 16 give utreexod's accumulator on 150 regtest blocks; the
   tests also check blocks sent in reverse (`ecsn/tests/sync.rs`, a peer answering from the
   fixture).
+- A bridge without the blocks of the best chain for 20 minutes is left for another
+  (`ecsn/tests/peers.rs`, tokio's paused time); the address book is saved and loaded across
+  restarts (the board: the erase block the chain store leaves at the end of the flash, loaded on the
+  emulated board; the host: `--book`).
 - One bridge at a time and a few ordinary peers (`ecsn/tests/peers.rs`; checked on mainnet from
   the host and the emulated board), the v1 and v2 transports (`ecsn/src/p2p.rs`'s tests: messages
   both ways, a 162 kB message received with its receive dropped every millisecond, a v1 peer; the
-  bridge and Bitcoin Core 32.1 peers in v2 on mainnet), no script check.
+  bridge and Bitcoin Core 32.1 peers in v2 on mainnet).
+- Scripts (`ecsn/tests/regtest.rs` and `mempool.rs`: block 111's and its transactions' pass, a
+  changed signature with the same outputs spent and the same proof is refused; mainnet blocks from
+  the host, about 0.4 s of a computer's core for 8,000 inputs).
 - The mempool (`ecsn/tests/mempool.rs`: block 111's transactions with the parts of the block's
   proof that prove what each spends, tampered with, with their conflicts, orphans, the cap and the
   block; a bridge in the same process relaying them as utreexod does); on mainnet from the host

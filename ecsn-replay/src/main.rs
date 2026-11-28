@@ -6,13 +6,16 @@
 //!
 //! ```text
 //! cargo build -p ecsn-replay --release --target wasm32-wasip1
-//! wasmtime run --dir <dir> target/wasm32-wasip1/release/ecsn-replay.wasm <dir>/<recording> <cap MiB> [decoded | raw]
+//! wasmtime run --dir <dir> target/wasm32-wasip1/release/ecsn-replay.wasm <dir>/<recording> <cap MiB> [decoded | raw | ecsn]
 //! ```
 //!
 //! The mempool: each transaction kept until a block confirms it or conflicts with it (or a later
 //! one spends the same output, replacing it), with what spends from it, kept decoded, or as its raw
 //! bytes with the outputs it spends (`raw`); beyond `cap` (its
-//! transactions' serialized bytes) the oldest leave first. Each block: its payload, decoded, held
+//! transactions' serialized bytes) the oldest leave first. Or the node's own mempool
+//! (`ecsn::mempool::Mempool`, `ecsn`), its transactions held unchecked (the recording has not
+//! what they spend) at a fee rate drawn from their txid, 1 to 50 sat/vB: the lowest rates leave
+//! first, and a conflict replaces only at a higher rate. Each block: its payload, decoded, held
 //! with a proof's room while validated, then dropped. The node's other memory at boot is a block
 //! of 3 MiB allocated first.
 //!
@@ -32,7 +35,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint, Transaction, Txid};
+use ecsn::mempool::Mempool;
 use rlsf::Tlsf;
 
 /// The board's heap: its 32 MiB of SDRAM.
@@ -271,14 +276,40 @@ struct Stats {
     most: (usize, usize, usize),
 }
 
-fn line(ms: u64, what: &str, pool: &Pool) {
+/// The mempool replayed: the model's, or the node's.
+enum Model {
+    Pool(Pool),
+    Ecsn(Mempool),
+}
+
+impl Model {
+    /// Its transactions and their serialized bytes.
+    fn held(&self) -> (usize, usize) {
+        match self {
+            Model::Pool(pool) => (pool.txs.len(), pool.bytes),
+            Model::Ecsn(mempool) => {
+                let stats = mempool.stats();
+                (stats.transactions, stats.bytes)
+            }
+        }
+    }
+}
+
+/// A fee for `tx`, at a rate drawn from its txid: 1 to 50 sat/vB.
+fn drawn_fee(tx: &Transaction, txid: &Txid) -> u64 {
+    let rate = 1 + u64::from(txid.as_byte_array()[0]) % 50;
+    rate * tx.vsize() as u64
+}
+
+fn line(ms: u64, what: &str, model: &Model) {
     let (free, largest) = HEAP.free();
+    let (txs, bytes) = model.held();
     println!(
         "{:>6.1} min {:<16} {:>6} tx {:>6} kB  heap {:>6} kB  free {:>6} kB  largest {:>6} kB",
         ms as f64 / 60_000.0,
         what,
-        pool.txs.len(),
-        pool.bytes / 1000,
+        txs,
+        bytes / 1000,
         HEAP.allocated() / 1000,
         free / 1000,
         largest / 1000
@@ -288,7 +319,7 @@ fn line(ms: u64, what: &str, pool: &Pool) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 && args.len() != 4 {
-        eprintln!("usage: ecsn-replay <recording> <mempool cap, MiB> [decoded | raw]");
+        eprintln!("usage: ecsn-replay <recording> <mempool cap, MiB> [decoded | raw | ecsn]");
         return ExitCode::FAILURE;
     }
     let cap: usize = match args[2].parse::<usize>() {
@@ -298,11 +329,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let raw = match args.get(3).map(String::as_str) {
-        None | Some("decoded") => false,
-        Some("raw") => true,
+    let (raw, ecsn) = match args.get(3).map(String::as_str) {
+        None | Some("decoded") => (false, false),
+        Some("raw") => (true, false),
+        Some("ecsn") => (false, true),
         Some(other) => {
-            eprintln!("{other}: decoded or raw");
+            eprintln!("{other}: decoded, raw or ecsn");
             return ExitCode::FAILURE;
         }
     };
@@ -325,10 +357,20 @@ fn main() -> ExitCode {
         ARENA >> 20,
         BOOT >> 20,
         cap >> 20,
-        if raw { "raw" } else { "decoded" }
+        if ecsn {
+            "by ecsn's mempool"
+        } else if raw {
+            "raw"
+        } else {
+            "decoded"
+        }
     );
 
-    let mut pool = Pool::default();
+    let mut model = if ecsn {
+        Model::Ecsn(Mempool::new(cap, 1))
+    } else {
+        Model::Pool(Pool::default())
+    };
     let mut stats = Stats {
         worst: None,
         misses: 0,
@@ -355,13 +397,15 @@ fn main() -> ExitCode {
             }
             if largest < len {
                 stats.misses += 1;
-                line(ms, "BLOCK MISSED", &pool);
+                line(ms, "BLOCK MISSED", &model);
                 // the node would make room: the oldest transactions leave until it fits
-                while HEAP.free().1 < len {
-                    let Some(oldest) = pool.order.pop_front() else {
-                        break;
-                    };
-                    pool.remove(oldest);
+                if let Model::Pool(pool) = &mut model {
+                    while HEAP.free().1 < len {
+                        let Some(oldest) = pool.order.pop_front() else {
+                            break;
+                        };
+                        pool.remove(oldest);
+                    }
                 }
             }
             let mut payload = vec![0u8; len];
@@ -377,10 +421,13 @@ fn main() -> ExitCode {
             let inputs: usize = block.txdata.iter().map(|t| t.input.len()).sum();
             let hashes = vec![[0u8; 32]; inputs * 8];
             let leaves = vec![[0u8; 16]; inputs];
-            line(ms, &format!("block {} kB", len / 1000), &pool);
-            pool.confirm(&block);
+            line(ms, &format!("block {} kB", len / 1000), &model);
+            match &mut model {
+                Model::Pool(pool) => pool.confirm(&block),
+                Model::Ecsn(mempool) => mempool.block_connected(&block),
+            }
             drop((hashes, leaves, block));
-            line(ms, "  confirmed", &pool);
+            line(ms, "  confirmed", &model);
         } else {
             let mut payload = vec![0u8; len];
             if input.read_exact(&mut payload).is_err() {
@@ -393,18 +440,32 @@ fn main() -> ExitCode {
             // raw: the bytes as received, in a buffer of their size
             let raw_bytes = raw.then(|| payload[..len].to_vec());
             drop(payload);
-            if pool.add(tx, raw_bytes, len, cap) {
+            let new = match &mut model {
+                Model::Pool(pool) => pool.add(tx, raw_bytes, len, cap),
+                Model::Ecsn(mempool) => {
+                    let txid = tx.compute_txid();
+                    let fee = drawn_fee(&tx, &txid);
+                    // a conflict at a lower rate, or below the lowest while full, is still a
+                    // transaction come
+                    !matches!(
+                        mempool.hold_unchecked(tx, fee),
+                        Err(ecsn::mempool::Reject::Known)
+                    )
+                }
+            };
+            if new {
                 txs += 1;
-                if pool.txs.len() > stats.most.0 {
-                    stats.most = (pool.txs.len(), pool.bytes, HEAP.allocated() - BOOT);
+                let (held, bytes) = model.held();
+                if held > stats.most.0 {
+                    stats.most = (held, bytes, HEAP.allocated() - BOOT);
                 }
                 if txs % 2000 == 0 {
-                    line(ms, "", &pool);
+                    line(ms, "", &model);
                 }
             }
         }
     }
-    line(last_ms, "end", &pool);
+    line(last_ms, "end", &model);
     let (most_txs, most_bytes, most_heap) = stats.most;
     println!(
         "{} transactions, {} blocks; the mempool held {} transactions at most, {} kB, taking {} kB of heap ({:.2} bytes of heap a byte)",

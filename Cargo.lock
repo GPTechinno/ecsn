@@ -215,6 +215,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoinconsensus"
+version = "0.106.0+26.0"
+source = "git+https://github.com/GPTechinno/rust-bitcoinconsensus?branch=verify-transaction#70851f1dfcf53b6a21d0e8130da10ba35ea4ee85"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,6 +337,7 @@ version = "0.1.0"
 dependencies = [
  "bip324",
  "bitcoin",
+ "ecsn-consensus",
  "embassy-futures",
  "embedded-io-adapters",
  "embedded-io-async",
@@ -340,6 +349,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecsn-consensus"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "bitcoinconsensus",
+]
+
+[[package]]
 name = "ecsn-host"
 version = "0.1.0"
 dependencies = [
@@ -347,6 +364,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "ecsn",
+ "ecsn-consensus",
  "embedded-io-adapters",
  "floresta-chain",
  "futures",
@@ -384,6 +402,8 @@ name = "ecsn-replay"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "ecsn",
+ "floresta-chain",
  "rlsf",
 ]
 

@@ -53,6 +53,15 @@ defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 
+# Bitcoin Core's script interpreter (C++), with the `scripts` feature
+ecsn-consensus = { path = "../ecsn-consensus", optional = true }
+
+[features]
+# Checks the scripts of blocks and of the mempool's transactions with Bitcoin Core's interpreter:
+# links Arm's C++ runtime (arm-none-eabi-g++, its newlib), and takes both flash banks (2 MB), the
+# Cortex-M4's included
+scripts = ["dep:ecsn-consensus"]
+
 [build-dependencies]
 # renders the display's glyphs
 fontdue = "0.9"
@@ -75,6 +84,11 @@ opt-level = 3
 # the hashes: 3 % less time per block validated at 3 than at "s" (the accumulator's SHA-512, a
 # third of the core, stays as costly), for 760 bytes; rustreexo, floresta-chain and bitcoin at 3
 # would add 0.5 % for 21 kB
+# the script interpreter's C++ and its libsecp256k1, whose build follows the package's opt-level
+# (a block's scripts hold the core for seconds)
+[profile.release.package.bitcoinconsensus]
+opt-level = 3
+
 [profile.release.package.bitcoin_hashes]
 opt-level = 3
 
@@ -91,3 +105,6 @@ bitcoin_hashes_1 = { package = "bitcoin_hashes", git = "https://github.com/GPTec
 # nodes, which a mainnet block's proof does not fit in the heap without: the `proof-memory` branch
 # of the fork, from its `v0.7.0`
 rustreexo = { git = "https://github.com/GPTechinno/rustreexo", branch = "proof-memory" }
+# libbitcoinconsensus with every input of a transaction verified in one call, and built for
+# arm-none-eabi: the `verify-transaction` branch of the fork of rust-bitcoinconsensus
+bitcoinconsensus = { git = "https://github.com/GPTechinno/rust-bitcoinconsensus", branch = "verify-transaction" }

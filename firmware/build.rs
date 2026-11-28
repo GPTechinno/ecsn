@@ -27,13 +27,38 @@ const FACES: &[(&str, u8, &[u16], &str)] = &[
 
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    fs::copy("memory.x", out.join("memory.x")).expect("memory.x");
+    let scripts = env::var_os("CARGO_FEATURE_SCRIPTS").is_some();
+    // `memory.x` only in OUT_DIR: the linker would take one beside the manifest first
+    let memory = fs::read_to_string("memory.x.in").expect("memory.x.in");
+    let memory = if scripts {
+        // bank 2 too, the Cortex-M4's: bank 1 holds the firmware without the script interpreter
+        let bank1 = "LENGTH = 1024K /* bank 1 */";
+        assert!(memory.contains(bank1), "memory.x: FLASH {bank1}");
+        memory.replace(bank1, "LENGTH = 2048K /* banks 1 and 2 */")
+    } else {
+        memory
+    };
+    fs::write(out.join("memory.x"), memory).expect("memory.x");
     println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=memory.x.in");
+    println!("cargo:rerun-if-changed=cxx.x");
+    println!("cargo:rerun-if-changed=link-cxx.x");
     println!("cargo:rerun-if-changed=build.rs");
 
     println!("cargo:rustc-link-arg-bins=--nmagic");
-    println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    if scripts {
+        fs::copy("cxx.x", out.join("cxx.x")).expect("cxx.x");
+        fs::copy("link-cxx.x", out.join("link-cxx.x")).expect("link-cxx.x");
+        println!("cargo:rustc-link-arg-bins=-Tcxx.x");
+        // cortex-m-rt's link.x keeping the exception tables
+        println!("cargo:rustc-link-arg-bins=-Tlink-cxx.x");
+        // the exception tables' references to type information (R_ARM_TARGET2): PC-relative, as
+        // bare-metal libsupc++ reads them, where lld's default is through a GOT
+        println!("cargo:rustc-link-arg-bins=--target2=rel");
+        cxx_runtime();
+    } else {
+        println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    }
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 
     let now = SystemTime::now()
@@ -42,6 +67,40 @@ fn main() {
     println!("cargo:rustc-env=ECSN_BUILD_TIME={now}");
 
     glyphs(&out);
+}
+
+/// Links Arm's C++ runtime for the Cortex-M7 with the FPU (the multilib `arm-none-eabi-g++` picks
+/// for those flags): libstdc++ and libsupc++ (exceptions), newlib, libgcc (the unwinder).
+fn cxx_runtime() {
+    println!("cargo:rerun-if-env-changed=CXX_thumbv7em_none_eabihf");
+    let cxx = env::var("CXX_thumbv7em_none_eabihf").unwrap_or_else(|_| "arm-none-eabi-g++".into());
+    let flags = [
+        "-mcpu=cortex-m7",
+        "-mthumb",
+        "-mfpu=fpv5-d16",
+        "-mfloat-abi=hard",
+    ];
+    let dir_of = |query: &str| {
+        let output = std::process::Command::new(&cxx)
+            .args(flags)
+            .arg(query)
+            .output()
+            .unwrap_or_else(|e| panic!("{cxx}: {e} (the `scripts` feature needs it)"));
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        assert!(path.is_absolute(), "{cxx} {query}: not found");
+        path.parent().expect("a directory").to_owned()
+    };
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dir_of("-print-file-name=libstdc++_nano.a").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dir_of("-print-libgcc-file-name").display()
+    );
+    for lib in ["stdc++_nano", "supc++_nano", "c_nano", "m", "gcc"] {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
 }
 
 /// Renders the faces into `glyphs.rs` (the faces and glyph metrics) and `coverage.bin` (the

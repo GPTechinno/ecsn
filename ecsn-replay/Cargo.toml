@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 bitcoin = { workspace = true, features = ["std"] }
+# the node's mempool, its transactions held unchecked
+ecsn = { workspace = true, features = ["unchecked"] }
+# `floresta-chain` is also a `cdylib`, which links only with `std`
+floresta-chain = { workspace = true, features = ["std"] }
 # the board's allocator: embedded-alloc's TLSF is rlsf's, with these parameters; `unstable` for
 # its list of blocks
 rlsf = { version = "0.2.3", features = ["unstable"] }

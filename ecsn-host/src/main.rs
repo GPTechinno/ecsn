@@ -31,7 +31,7 @@ use file_flash::FileFlash;
 use floresta_chain::{BlockchainInterface, ChainParams, ChainStore};
 use futures::future::join_all;
 use tokio::net::TcpStream;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -80,7 +80,18 @@ struct Args {
     /// bridge changes its own copy of each transaction it relays this way (see the README)
     #[arg(long, value_name = "MB", default_value_t = 0)]
     mempool: usize,
+    /// Check no script: by default the blocks' and the mempool's are checked with Bitcoin Core's
+    /// script interpreter (libbitcoinconsensus)
+    #[arg(long)]
+    no_scripts: bool,
+    /// With `--follow`: keep the address book in this file across runs (read at the start,
+    /// written each minute it changed)
+    #[arg(long)]
+    book: Option<PathBuf>,
 }
+
+/// The most bytes of a saved address book.
+const BOOK_BYTES: usize = 64 * 1024;
 
 /// TCP connections, given 10 s to open.
 struct TcpDialer;
@@ -195,6 +206,8 @@ async fn main() -> ExitCode {
         } else {
             0
         },
+        verify_scripts: (!args.no_scripts)
+            .then_some(ecsn_consensus::verify_scripts as ecsn::scripts::VerifyScripts),
     };
 
     let Some(path) = &args.store else {
@@ -283,6 +296,12 @@ async fn run<S: ChainStore>(args: &Args, store: S, config: Config) -> ExitCode {
 /// Follows the chain until stopped: the bridge's slot (`peer` tried first), the ordinary peers'
 /// slots, the DNS seeds, and the connections logged every minute.
 async fn follow<S: ChainStore>(args: &Args, node: &Node<S>, peer: &str) -> ExitCode {
+    if let Some(path) = &args.book {
+        if let Ok(saved) = std::fs::read(path) {
+            let added = node.load_book(&saved);
+            info!("{}: {added} addresses", path.display());
+        }
+    }
     match tokio::net::lookup_host(peer).await {
         Ok(addrs) => {
             for addr in addrs.filter(|a| args.ipv6 || a.is_ipv4()) {
@@ -302,8 +321,17 @@ async fn follow<S: ChainStore>(args: &Args, node: &Node<S>, peer: &str) -> ExitC
     });
     let mut resolver = SystemResolver;
     let report = async {
+        let mut book_saved = node.book_changes();
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
+            if let Some(path) = &args.book {
+                if node.book_changes() != book_saved {
+                    book_saved = node.book_changes();
+                    if let Err(e) = std::fs::write(path, node.book_bytes(BOOK_BYTES)) {
+                        warn!("{}: {e}", path.display());
+                    }
+                }
+            }
             let status = node.status();
             let chain = node.chain();
             let validated = chain.get_validation_index().unwrap_or(0);

@@ -28,6 +28,7 @@ fn config() -> Config {
         v2_bridge: true,
         free_memory: None,
         mempool: 0,
+        verify_scripts: None,
     }
 }
 
@@ -513,4 +514,12 @@ fn after_a_power_cut_anywhere_the_store_mounts_and_resumes() {
         );
         assert_eq!(store.load_roots_for_block(1).unwrap(), None);
     }
+}
+
+#[test]
+fn a_flash_of_128_mb_keeps_an_erase_block_spare() {
+    let layout = ecsn::store::Layout::new(128 << 20, 8192).unwrap();
+    assert_eq!(layout.spare(), Some(((128 << 20) - 8192, 8192)));
+    let end = layout.records_at as u64 + layout.records as u64 * ecsn::store::RECORD_SIZE as u64;
+    assert!(end <= (128 << 20) - 8192);
 }

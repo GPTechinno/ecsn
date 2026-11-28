@@ -2,9 +2,13 @@
 //! announce (`addr`, `addrv2`), with what each serves and how the connections to it went.
 //!
 //! Times are the caller's monotonic seconds.
+//!
+//! The book can be saved and loaded again across restarts ([`AddrBook::encode`],
+//! [`AddrBook::load`]): its most useful entries within a size, what each serves and how the
+//! connections to it went, not when to retry it.
 
 use alloc::vec::Vec;
-use core::net::{IpAddr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use bitcoin::Network;
 
@@ -41,6 +45,8 @@ pub enum Outcome {
     WrongRole,
     /// It sent invalid data.
     Misbehaved,
+    /// A bridge that lacked the blocks of the best header chain for long.
+    Behind,
 }
 
 /// An address and what the node knows of it.
@@ -73,9 +79,26 @@ const BAN: u64 = 24 * 3600;
 const AFTER_ENDED: u64 = 30;
 /// The same for the configured peer.
 const AFTER_ENDED_CONFIGURED: u64 = 5;
+/// How long a bridge that fell behind the best chain is not tried again: the others first.
+const AFTER_BEHIND: u64 = 1800;
 
 /// A full node serving witnesses: what an ordinary peer must serve.
 const FULL: u64 = services::NETWORK | services::WITNESS;
+
+/// The service bits defined so far: NETWORK, GETUTXO, BLOOM, WITNESS, XTHIN, COMPACT_FILTERS,
+/// NETWORK_LIMITED, P2P_V2, and BIP 183's two.
+const KNOWN_SERVICES: u64 = 0b11_1100_0101_1111;
+
+/// What an advertisement of services is taken to mean before the handshake: one that claims bits
+/// no node defines (all 64, on mainnet, for addresses of ordinary nodes) is not believed for the
+/// rare bits that make a bridge.
+fn advertised(services: u64) -> u64 {
+    if services & !KNOWN_SERVICES != 0 {
+        services & !(services::UTREEXO | services::UTREEXO_ARCHIVE)
+    } else {
+        services
+    }
+}
 
 pub struct AddrBook {
     entries: Vec<Entry>,
@@ -83,7 +106,12 @@ pub struct AddrBook {
     /// Whether IPv6 addresses are kept (the node can reach them).
     ipv6: bool,
     rng: u64,
+    /// Changes to what a saved book holds, counted.
+    changes: u32,
 }
+
+/// The first byte of a saved book: its format.
+const SAVED_BOOK: u8 = 1;
 
 impl AddrBook {
     /// An empty book. `seed` drives the random picks.
@@ -93,7 +121,107 @@ impl AddrBook {
             capacity: CAPACITY,
             ipv6,
             rng: seed,
+            changes: 0,
         }
+    }
+
+    /// Changes to what [`AddrBook::encode`] gives, counted since the book was made: to save it
+    /// again only when it changed.
+    pub fn changes(&self) -> u32 {
+        self.changes
+    }
+
+    /// The most useful entries in at most `max` bytes, for [`AddrBook::load`] after a restart:
+    /// the configured peer, then those reached (bridges first, the most handshakes first), then
+    /// the others (the fewest failures first).
+    pub fn encode(&self, max: usize) -> Vec<u8> {
+        let mut order: Vec<&Entry> = self.entries.iter().collect();
+        let rank = |e: &Entry| {
+            (
+                e.source != Source::Configured,
+                e.handshakes == 0,
+                e.services & services::UTREEXO_ARCHIVE == 0,
+                u32::MAX - e.handshakes,
+                e.failures,
+            )
+        };
+        order.sort_by_key(|e| rank(e));
+        let mut out = alloc::vec![SAVED_BOOK];
+        for e in order {
+            let (kind, ip): (u8, Vec<u8>) = match e.addr.ip() {
+                IpAddr::V4(ip) => (4, ip.octets().to_vec()),
+                IpAddr::V6(ip) => (6, ip.octets().to_vec()),
+            };
+            let size = 1 + ip.len() + 2 + 8 + 1 + 2 + 1 + 1;
+            if out.len() + size > max {
+                break;
+            }
+            out.push(kind);
+            out.extend_from_slice(&ip);
+            out.extend_from_slice(&e.addr.port().to_le_bytes());
+            out.extend_from_slice(&e.services.to_le_bytes());
+            out.push(match e.source {
+                Source::Configured => 0,
+                Source::Seed => 1,
+                Source::Peer => 2,
+            });
+            out.extend_from_slice(&(e.handshakes.min(u16::MAX as u32) as u16).to_le_bytes());
+            out.push(e.failures.min(u8::MAX as u32) as u8);
+            out.push(e.v1_only as u8);
+        }
+        out
+    }
+
+    /// Adds the entries of a book [`AddrBook::encode`] gave, those not known already; a saved
+    /// configured peer comes back as one a peer gave (the configured peer is the caller's to
+    /// add). Returns how many it added; none from bytes it cannot read.
+    pub fn load(&mut self, bytes: &[u8]) -> usize {
+        if bytes.first() != Some(&SAVED_BOOK) {
+            return 0;
+        }
+        let mut r = &bytes[1..];
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let (head, tail) = (r.get(..n)?, r.get(n..)?);
+            r = tail;
+            Some(head)
+        };
+        let mut added = 0;
+        while let Some(kind) = take(1) {
+            let ip = match kind[0] {
+                4 => match take(4) {
+                    Some(b) => IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])),
+                    None => break,
+                },
+                6 => match take(16).and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                    Some(b) => IpAddr::V6(Ipv6Addr::from(b)),
+                    None => break,
+                },
+                _ => break,
+            };
+            let Some(rest) = take(15) else {
+                break;
+            };
+            let port = u16::from_le_bytes([rest[0], rest[1]]);
+            let mut services = [0; 8];
+            services.copy_from_slice(&rest[2..10]);
+            let source = match rest[10] {
+                1 => Source::Seed,
+                _ => Source::Peer,
+            };
+            let handshakes = u16::from_le_bytes([rest[11], rest[12]]) as u32;
+            let failures = rest[13] as u32;
+            let v1_only = rest[14] != 0;
+            let addr = SocketAddr::new(ip, port);
+            if self.add(addr, u64::from_le_bytes(services), source) {
+                if let Some(e) = self.entries.iter_mut().find(|e| e.addr == addr) {
+                    e.handshakes = handshakes;
+                    e.failures = failures;
+                    e.v1_only = v1_only;
+                }
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Adds an address, or merges the services of one already known that has not done its
@@ -103,6 +231,7 @@ impl AddrBook {
         if addr.port() == 0 || (addr.is_ipv6() && !self.ipv6) {
             return false;
         }
+        let services = advertised(services);
         if source != Source::Configured && !routable(addr.ip()) {
             return false;
         }
@@ -128,6 +257,7 @@ impl AddrBook {
             retry_at: 0,
             in_use: false,
         });
+        self.changes = self.changes.wrapping_add(1);
         true
     }
 
@@ -145,6 +275,7 @@ impl AddrBook {
     pub fn v1_only(&mut self, addr: SocketAddr) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.addr == addr) {
             e.v1_only = true;
+            self.changes = self.changes.wrapping_add(1);
         }
     }
 
@@ -210,6 +341,7 @@ impl AddrBook {
             e.handshakes += 1;
             e.failures = 0;
             e.services = services;
+            self.changes = self.changes.wrapping_add(1);
         }
     }
 
@@ -224,6 +356,7 @@ impl AddrBook {
         match outcome {
             Outcome::Unreached => {
                 e.failures += 1;
+                self.changes = self.changes.wrapping_add(1);
                 if !configured && e.handshakes == 0 && e.failures >= FORGET_AFTER {
                     self.entries.swap_remove(i);
                     return;
@@ -243,7 +376,9 @@ impl AddrBook {
             Outcome::Misbehaved => {
                 e.failures += 1;
                 e.retry_at = now + if configured { backoff(e) } else { BAN };
+                self.changes = self.changes.wrapping_add(1);
             }
+            Outcome::Behind => e.retry_at = now + AFTER_BEHIND,
         }
     }
 
@@ -395,6 +530,69 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn an_advertisement_of_every_service_makes_no_bridge() {
+        let mut book = AddrBook::new(false, 1);
+        assert!(book.add(addr("35.228.230.233:8333"), u64::MAX, Source::Peer));
+        assert_eq!(book.count(Role::Bridge), 0);
+        // still an ordinary peer to try
+        assert_eq!(book.count(Role::Peer), 1);
+        // a bridge's own advertisement is believed
+        let bridge = FULL | services::P2P_V2 | services::UTREEXO | services::UTREEXO_ARCHIVE;
+        assert!(book.add(addr("1.231.31.3:8333"), bridge | 0x444, Source::Peer));
+        assert_eq!(book.count(Role::Bridge), 1);
+    }
+
+    #[test]
+    fn a_saved_book_comes_back_its_best_entries_first() {
+        let mut book = AddrBook::new(true, 1);
+        let configured = addr("5.6.7.8:8333");
+        let bridge = addr("1.231.31.3:8333");
+        let reached = addr("[2a01:4f8::1]:8333");
+        let failing = addr("8.8.4.4:8333");
+        assert!(book.add(configured, 0, Source::Configured));
+        assert!(book.add(bridge, 0, Source::Seed));
+        assert!(book.add(reached, FULL, Source::Peer));
+        assert!(book.add(failing, FULL, Source::Peer));
+        book.handshake(bridge, FULL | services::UTREEXO_ARCHIVE);
+        book.handshake(reached, FULL);
+        book.v1_only(reached);
+        book.release(failing, Outcome::Unreached, 0);
+        let changes = book.changes();
+        assert!(changes > 0);
+
+        let saved = book.encode(1000);
+        let mut again = AddrBook::new(true, 2);
+        assert_eq!(again.load(&saved), 4);
+        let entry = |a| {
+            again
+                .entries()
+                .iter()
+                .find(|e| e.addr == a)
+                .unwrap()
+                .clone()
+        };
+        // the configured peer comes back as an ordinary one: the caller adds it
+        assert_eq!(entry(configured).source, Source::Peer);
+        assert_eq!(entry(bridge).source, Source::Seed);
+        assert_eq!(entry(bridge).handshakes, 1);
+        assert!(entry(bridge).services & services::UTREEXO_ARCHIVE != 0);
+        assert!(entry(reached).v1_only);
+        assert_eq!(entry(failing).failures, 1);
+        // again: nothing new
+        assert_eq!(again.load(&saved), 0);
+
+        // within a size: the configured peer and the bridge first
+        let small = book.encode(1 + 2 * 20);
+        let mut few = AddrBook::new(true, 3);
+        assert_eq!(few.load(&small), 2);
+        assert!(few.entries().iter().any(|e| e.addr == configured));
+        assert!(few.entries().iter().any(|e| e.addr == bridge));
+        // not a book
+        assert_eq!(few.load(&[0xff, 1, 2]), 0);
+        assert_eq!(few.load(&small[..small.len() - 3]), 0);
     }
 
     #[test]

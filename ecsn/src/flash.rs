@@ -28,6 +28,55 @@ pub trait Flash {
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error>;
 }
 
+/// The magic of a saved record ([`save_record`]).
+const RECORD_MAGIC: [u8; 8] = *b"ECSNSAVE";
+const RECORD_HEADER: usize = 16;
+
+/// Saves `data` in the erase blocks `at..at + len` of `flash`, erased first: a header (magic,
+/// length, CRC-32) then the bytes. A power cut while it saves leaves no record, not a wrong one.
+/// Returns `false`, saving nothing, if it does not fit.
+pub fn save_record<F: Flash>(
+    flash: &mut F,
+    at: u32,
+    len: u32,
+    data: &[u8],
+) -> Result<bool, F::Error> {
+    let w = F::WRITE_SIZE as usize;
+    let total = (RECORD_HEADER + data.len()).div_ceil(w) * w;
+    if total > len as usize {
+        return Ok(false);
+    }
+    let mut bytes = vec![0xFF; total];
+    bytes[..8].copy_from_slice(&RECORD_MAGIC);
+    bytes[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    bytes[12..16].copy_from_slice(&crate::store::crc32(&[data]).to_le_bytes());
+    bytes[RECORD_HEADER..RECORD_HEADER + data.len()].copy_from_slice(data);
+    flash.erase(at, at + len)?;
+    // the bytes, then the header: a record is whole once its magic is written
+    if total > RECORD_HEADER {
+        flash.write(at + RECORD_HEADER as u32, &bytes[RECORD_HEADER..])?;
+    }
+    flash.write(at, &bytes[..RECORD_HEADER])?;
+    Ok(true)
+}
+
+/// The record [`save_record`] left in `at..at + len`, if one is there whole.
+pub fn load_record<F: Flash>(flash: &F, at: u32, len: u32) -> Option<Vec<u8>> {
+    let mut header = [0; RECORD_HEADER];
+    flash.read(at, &mut header).ok()?;
+    if header[..8] != RECORD_MAGIC {
+        return None;
+    }
+    let size = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
+    let crc = u32::from_le_bytes(header[12..16].try_into().ok()?);
+    if RECORD_HEADER + size > len as usize {
+        return None;
+    }
+    let mut data = vec![0; size];
+    flash.read(at + RECORD_HEADER as u32, &mut data).ok()?;
+    (crate::store::crc32(&[&data]) == crc).then_some(data)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RamFlashError {
     /// Outside the flash, or not aligned to the write or erase size.
@@ -152,5 +201,34 @@ impl Flash for RamFlash {
         }
         self.bytes[from as usize..to as usize].fill(0xFF);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_record_comes_back_whole_or_not_at_all() {
+        let mut flash = RamFlash::new(64 * 1024);
+        let (at, len) = (48 * 1024, 16 * 1024);
+        assert_eq!(load_record(&flash, at, len), None);
+        assert!(save_record(&mut flash, at, len, b"the book").unwrap());
+        assert_eq!(
+            load_record(&flash, at, len).as_deref(),
+            Some(&b"the book"[..])
+        );
+        // too large: nothing saved, the record before kept
+        assert!(!save_record(&mut flash, at, len, &[0; 17 * 1024]).unwrap());
+        assert_eq!(
+            load_record(&flash, at, len).as_deref(),
+            Some(&b"the book"[..])
+        );
+        // a power cut while it saves: no record after the reset, not a wrong one
+        let mut cut = flash.clone();
+        cut.cut_power_after(4);
+        assert!(save_record(&mut cut, at, len, b"another book").is_err());
+        let after = RamFlash::from_bytes(cut.bytes().to_vec());
+        assert_eq!(load_record(&after, at, len), None);
     }
 }

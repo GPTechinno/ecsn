@@ -34,6 +34,7 @@ fn node_at_110(fixture: &Fixture) -> Node<MemChainStore> {
         v2_bridge: true,
         free_memory: None,
         mempool: 0,
+        verify_scripts: None,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     for block in &fixture.blocks {
@@ -220,6 +221,38 @@ fn a_block_drops_the_orphans() {
 }
 
 #[test]
+fn scripts_are_checked_when_asked_for() {
+    use ecsn::scripts::ScriptRules;
+    use floresta_chain::ChainParams;
+    let relay = Relay::new();
+    let mut mempool = Mempool::new(1 << 20, 13);
+    mempool.check_scripts(
+        ecsn_consensus::verify_scripts,
+        ScriptRules::new(&ChainParams::from(Network::Regtest)),
+    );
+    // a signature changed: same outputs spent, same proof
+    let mut utx = relay.utx(1);
+    let input = &mut utx.tx.input[0];
+    if input.witness.is_empty() {
+        let mut script = input.script_sig.to_bytes();
+        script[5] ^= 1;
+        input.script_sig = script.into();
+    } else {
+        let mut items: Vec<Vec<u8>> = input.witness.iter().map(<[u8]>::to_vec).collect();
+        items[0][5] ^= 1;
+        input.witness = bitcoin::Witness::from_slice(&items);
+    }
+    assert!(matches!(
+        relay.admit(&mut mempool, utx),
+        Err(Reject::Script(0))
+    ));
+    for i in 1..=5 {
+        relay.admit(&mut mempool, relay.utx(i)).unwrap();
+    }
+    assert_eq!(mempool.stats().transactions, 5);
+}
+
+#[test]
 fn a_changed_proof_hash_is_refused() {
     let relay = Relay::new();
     let mut mempool = Mempool::new(1 << 20, 3);
@@ -378,35 +411,33 @@ fn a_block_off_the_tip_empties_the_mempool() {
 
 /// A bridge that serves blocks up to 110, then relays block 111's transactions as utreexod does
 /// (announced with the positions of the leaves they spend, sent with the proof hashes asked
-/// for), then block 111, checking the node's mempool on the way. Its announcements: transaction
-/// 1 with its positions in the next `inv`; 4; 5, a child of 4, whose answer comes first; 4
-/// again with 2. It also sends 3 unasked. Hangs up at the end.
+/// for), then block 111, checking the node's mempool on the way. Its announcements: 1; 4; 5, a
+/// child of 4, whose answer comes first; 4 again with 2. It also sends 3 unasked. Hangs up at
+/// the end.
 async fn relaying_bridge(io: DuplexStream, relay: &Relay, node: &Node<MemChainStore>) {
     let fixture = &relay.fixture;
     let leaves = relay.node.chain().acc().leaves;
     let txids = relay.block_txids();
     let mut conn = Connection::new(FromTokio::new(io), Network::Regtest);
-    let tx_entry = |i: usize| Inventory {
-        kind: inv::TX,
-        hash: txids[i].to_byte_array(),
-    };
-    let positions_of = |i: usize| -> Vec<Inventory> {
-        pack_positions(&relay.utx(i).targets)
-            .into_iter()
-            .map(|hash| Inventory {
-                kind: inv::PROOF_POSITIONS,
-                hash,
-            })
-            .collect()
-    };
     let group = |i: usize| {
-        let mut entries = vec![tx_entry(i)];
-        entries.extend(positions_of(i));
+        let mut entries = vec![Inventory {
+            kind: inv::TX,
+            hash: txids[i].to_byte_array(),
+        }];
+        entries.extend(
+            pack_positions(&relay.utx(i).targets)
+                .into_iter()
+                .map(|hash| Inventory {
+                    kind: inv::PROOF_POSITIONS,
+                    hash,
+                }),
+        );
         entries
     };
     let mut headers = 110;
-    // the transactions asked for, in order, and transaction 4 while 5 is not answered
+    // the transactions asked for, in order, those answered, and 4 while 5 is not answered
     let mut asked = Vec::new();
+    let mut answered = Vec::new();
     let mut held = None;
     while let Ok(message) = conn.recv().await {
         let answers = match message {
@@ -456,13 +487,19 @@ async fn relaying_bridge(io: DuplexStream, relay: &Relay, node: &Node<MemChainSt
                         5 => {
                             answers.push(Message::UtreexoTx(utx));
                             answers.extend(held.take().map(Message::UtreexoTx));
+                            answered.extend([5, 4]);
                             // not asked for
                             answers.push(Message::UtreexoTx(relay.utx(3)));
-                            answers.push(Message::Ping(7));
                         }
-                        _ => answers.push(Message::UtreexoTx(utx)),
+                        _ => {
+                            answers.push(Message::UtreexoTx(utx));
+                            answered.push(n);
+                        }
                     }
                     i = end;
+                }
+                if [1, 2, 4, 5].iter().all(|n| answered.contains(n)) {
+                    answers.push(Message::Ping(7));
                 }
                 answers
             }
@@ -480,11 +517,9 @@ async fn relaying_bridge(io: DuplexStream, relay: &Relay, node: &Node<MemChainSt
                     .iter()
                     .any(|e| e.block() == Some(fixture.blocks[109].block_hash()))
                 {
-                    // synced: transaction 1, its positions in the next `inv`
-                    answers.push(Message::Inv(vec![tx_entry(1)]));
-                    let mut next = positions_of(1);
-                    next.extend(group(4));
-                    answers.push(Message::Inv(next));
+                    // synced: the transactions
+                    answers.push(Message::Inv(group(1)));
+                    answers.push(Message::Inv(group(4)));
                     answers.push(Message::Inv(group(5)));
                     let mut last = group(4);
                     last.extend(group(2));
@@ -505,14 +540,14 @@ async fn relaying_bridge(io: DuplexStream, relay: &Relay, node: &Node<MemChainSt
                 ]
             }
             Message::Pong(7) => {
-                // each asked for once, 2 waiting for the next `inv`
-                assert_eq!(asked, [1, 4, 5]);
+                // each asked for once
+                assert_eq!(asked, [1, 4, 5, 2]);
                 // 5 waited for 4; 3 refused, not asked for
                 let status = node.status();
-                assert_eq!((status.taken, status.refused), (3, 1));
-                assert_eq!(status.mempool.transactions, 3);
+                assert_eq!((status.taken, status.refused), (4, 1));
+                assert_eq!(status.mempool.transactions, 4);
                 assert_eq!(status.mempool.orphans, 0);
-                for i in [1, 4, 5] {
+                for i in [1, 2, 4, 5] {
                     assert!(node.mempool().contains(&txids[i]));
                 }
                 // block 111, announced
@@ -549,6 +584,7 @@ fn the_bridge_relays_transactions_once_synced() {
         v2_bridge: true,
         free_memory: None,
         mempool: 1 << 20,
+        verify_scripts: None,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()

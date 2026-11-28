@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ecsn", "ecsn-host", "ecsn-regtest", "ecsn-mempool", "ecsn-replay"]
+members = ["ecsn", "ecsn-consensus", "ecsn-host", "ecsn-regtest", "ecsn-mempool", "ecsn-replay"]
 # The firmware targets thumbv7em-none-eabihf with its own profile, runner and lockfile (see
 # firmware/.cargo/config.toml), so it is built from its own directory, outside of this host workspace.
 # ecsn-emu-disco builds with the nightly Rust of BLIT, its window (see ecsn-emu-disco/rust-toolchain.toml).
@@ -33,3 +33,8 @@ ecsn = { path = "ecsn" }
 # nodes (about 21 MB for some mainnet blocks, 2 MB with it): the `proof-memory` branch of the fork,
 # from its `v0.7.0`
 rustreexo = { git = "https://github.com/GPTechinno/rustreexo", branch = "proof-memory" }
+# libbitcoinconsensus (Bitcoin Core 26.0) with every input of a transaction verified in one call,
+# the transaction deserialized and its signature hashes' shared data computed once (four times
+# faster on a mainnet block), and built without std for arm-none-eabi: the `verify-transaction`
+# branch of the fork of rust-bitcoinconsensus
+bitcoinconsensus = { git = "https://github.com/GPTechinno/rust-bitcoinconsensus", branch = "verify-transaction" }

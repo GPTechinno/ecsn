@@ -7,6 +7,7 @@ mod common;
 use bitcoin::Network;
 use common::{fixture, Fixture};
 use ecsn::node::{Config, Node};
+use ecsn::scripts::VerifyScripts;
 use ecsn::store::MemChainStore;
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
 use floresta_chain::{BlockchainInterface, CompactLeafData};
@@ -15,6 +16,14 @@ use rustreexo::proof::Proof;
 
 /// A node with every header, and every block validated up to 110.
 fn node_at_110(fixture: &Fixture) -> Node<MemChainStore> {
+    node_at_110_with(fixture, None)
+}
+
+/// The same, checking scripts with `verify_scripts`.
+fn node_at_110_with(
+    fixture: &Fixture,
+    verify_scripts: Option<VerifyScripts>,
+) -> Node<MemChainStore> {
     let config = Config {
         network: Network::Regtest,
         user_agent: String::new(),
@@ -25,6 +34,7 @@ fn node_at_110(fixture: &Fixture) -> Node<MemChainStore> {
         v2_bridge: true,
         free_memory: None,
         mempool: 0,
+        verify_scripts,
     };
     let node = Node::new(MemChainStore::new(), config, 0).unwrap();
     for block in &fixture.blocks {
@@ -65,6 +75,63 @@ fn the_proven_block_gives_utreexods_accumulator() {
     assert_eq!(acc.leaves, fixture.leaves);
     let roots: Vec<String> = acc.roots.iter().map(ToString::to_string).collect();
     assert_eq!(roots, fixture.roots);
+}
+
+/// Changes a signature of block 111's first transaction: its first input's, in its witness or
+/// its script.
+fn change_a_signature(block: &mut bitcoin::Block) {
+    let input = &mut block.txdata[1].input[0];
+    if input.witness.is_empty() {
+        let mut script = input.script_sig.to_bytes();
+        script[5] ^= 1;
+        input.script_sig = script.into();
+    } else {
+        let mut items: Vec<Vec<u8>> = input.witness.iter().map(<[u8]>::to_vec).collect();
+        items[0][5] ^= 1;
+        input.witness = bitcoin::Witness::from_slice(&items);
+    }
+}
+
+#[test]
+fn the_scripts_of_the_proven_block_pass() {
+    let fixture = fixture();
+    let node = node_at_110_with(&fixture, Some(ecsn_consensus::verify_scripts));
+    assert!(connect_111(
+        &node,
+        &fixture,
+        &fixture.leaf_data,
+        fixture.proof.clone()
+    ));
+}
+
+#[test]
+fn a_changed_signature_is_refused_when_scripts_are_checked() {
+    let fixture = fixture();
+    let mut changed = fixture.blocks[110].clone();
+    change_a_signature(&mut changed);
+    // without scripts the block passes: the outputs it spends and their proof are the same
+    let node = node_at_110(&fixture);
+    assert!(node
+        .connect_block(111, &changed, &fixture.leaf_data, fixture.proof.clone())
+        .is_ok());
+    let node = node_at_110_with(&fixture, Some(ecsn_consensus::verify_scripts));
+    let refused = node.connect_block(111, &changed, &fixture.leaf_data, fixture.proof.clone());
+    assert!(
+        matches!(
+            refused,
+            Err(floresta_chain::BlockchainError::BlockValidation(
+                floresta_chain::BlockValidationErrors::ScriptValidationError(_)
+            ))
+        ),
+        "{refused:?}"
+    );
+    // nothing changed: the block itself goes through
+    assert!(connect_111(
+        &node,
+        &fixture,
+        &fixture.leaf_data,
+        fixture.proof.clone()
+    ));
 }
 
 #[test]

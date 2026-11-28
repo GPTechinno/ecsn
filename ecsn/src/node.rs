@@ -17,11 +17,12 @@
 //!
 //! Everything runs in one task: the connections share the node through `&Node`.
 //!
-//! Scripts are not checked (`floresta-chain` without `bitcoinkernel`): a block is accepted on
-//! its proof of work, its structure, its Utreexo proof, the amounts and the other rules
-//! `floresta-chain` checks.
+//! A block is accepted on its proof of work, its structure, its Utreexo proof, the amounts and
+//! the other rules `floresta-chain` checks, and its scripts when the node is given a script
+//! interpreter ([`Config::verify_scripts`]; `floresta-chain` checks none without
+//! `bitcoinkernel`).
 
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -32,14 +33,14 @@ use core::task::{Poll, Waker};
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network, Txid};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_io_async::{Read, Write};
 use floresta_chain::extensions::BlockExt;
 use floresta_chain::proof_util::process_proof;
 use floresta_chain::pruned_utreexo::{IBDState, UpdatableChainstate};
 use floresta_chain::{
     AssumeUtreexoValue, AssumeValidArg, BlockValidationErrors, BlockchainError,
-    BlockchainInterface, ChainState, ChainStore, CompactLeafData,
+    BlockchainInterface, ChainParams, ChainState, ChainStore, CompactLeafData,
 };
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
@@ -52,6 +53,7 @@ use crate::p2p::{
     self, inv, services, Connection, GetUtreexoProof, Inventory, Message, NetAddress, UtreexoTx,
     Version, MAX_HEADERS, PROTOCOL_VERSION,
 };
+use crate::scripts::{self, ScriptRules, VerifyScripts};
 
 /// What the node is set up with.
 pub struct Config {
@@ -76,6 +78,9 @@ pub struct Config {
     /// The most serialized bytes of unconfirmed transactions the mempool holds; 0 for no
     /// mempool, the bridge then asked for no transactions.
     pub mempool: usize,
+    /// A script interpreter: the scripts of each block validated and of each transaction the
+    /// mempool takes are checked with it. None: no script is checked.
+    pub verify_scripts: Option<VerifyScripts>,
 }
 
 /// Validated heights between two progress lines while syncing.
@@ -101,6 +106,13 @@ const SHORT_LIVED: u64 = 60;
 const DISCOVER_EVERY: u64 = 600;
 /// Below this many addresses of ordinary peers, [`Node::discover`] asks the DNS seeds.
 const FEW_PEERS: usize = 32;
+/// Seconds without a block validated, the best header chain ahead, after which the bridge's
+/// connection ends: the bridge lacks the blocks of the best chain (it is behind, or on a weaker
+/// chain), and another may have them.
+const STALE_BRIDGE: u64 = 1200;
+/// Seconds between two looks at the bridge's progress.
+const STALE_CHECK: u64 = 60;
+
 /// The most transactions asked of the bridge and not here yet.
 const MAX_ASKED: usize = 5000;
 
@@ -359,11 +371,11 @@ pub struct Node<S: ChainStore> {
     book: RefCell<AddrBook>,
     status: RefCell<Status>,
     mempool: RefCell<Mempool>,
+    /// The script interpreter and when each rule applies.
+    scripts: Option<(VerifyScripts, ScriptRules)>,
     /// The transactions asked of the bridge, until they come, it has them no more, or the next
     /// block.
     asked: RefCell<BTreeSet<Txid>>,
-    /// The last transaction an `inv` announced, with the positions so far.
-    inv_tail: RefCell<Vec<Inventory>>,
 }
 
 impl<S: ChainStore> Node<S> {
@@ -372,7 +384,13 @@ impl<S: ChainStore> Node<S> {
     pub fn new(store: S, config: Config, nonce: u64) -> Result<Self, BlockchainError> {
         let chain = ChainState::open(store, config.network, AssumeValidArg::Disabled)?;
         let book = AddrBook::new(config.ipv6, nonce ^ 0x5eed);
-        let mempool = Mempool::new(config.mempool, nonce ^ 0x6d70_6f6f_6c00);
+        let scripts = config
+            .verify_scripts
+            .map(|verify| (verify, ScriptRules::new(&ChainParams::from(config.network))));
+        let mut mempool = Mempool::new(config.mempool, nonce ^ 0x6d70_6f6f_6c00);
+        if let Some((verify, rules)) = &scripts {
+            mempool.check_scripts(*verify, rules.clone());
+        }
         Ok(Self {
             chain,
             config,
@@ -383,8 +401,8 @@ impl<S: ChainStore> Node<S> {
             book: RefCell::new(book),
             status: RefCell::new(Status::default()),
             mempool: RefCell::new(mempool),
+            scripts,
             asked: RefCell::new(BTreeSet::new()),
-            inv_tail: RefCell::new(Vec::new()),
         })
     }
 
@@ -409,6 +427,22 @@ impl<S: ChainStore> Node<S> {
     /// The mempool.
     pub fn mempool(&self) -> core::cell::Ref<'_, Mempool> {
         self.mempool.borrow()
+    }
+
+    /// The book's most useful entries in at most `max` bytes, to save and load after a restart
+    /// ([`Node::load_book`]).
+    pub fn book_bytes(&self, max: usize) -> Vec<u8> {
+        self.book.borrow().encode(max)
+    }
+
+    /// Adds the entries of a book [`Node::book_bytes`] gave. Returns how many.
+    pub fn load_book(&self, bytes: &[u8]) -> usize {
+        self.book.borrow_mut().load(bytes)
+    }
+
+    /// Changes to the book's saved entries, counted: to save it only when it changed.
+    pub fn book_changes(&self) -> u32 {
+        self.book.borrow().changes()
     }
 
     /// Adds a peer's address to the book: `Source::Configured` for the bridge to try first.
@@ -701,7 +735,8 @@ impl<S: ChainStore> Node<S> {
                     .check_block_structure()
                     .map_err(BlockchainError::from)?;
                 let proof_hashes = proof.hashes.len();
-                self.connect_block(height, &block, &leaf_data, proof)?;
+                self.validate_block(height, &block, &leaf_data, proof, true)
+                    .await?;
                 debug!(
                     "block {height} {hash}: {} transactions, {} inputs proven by {proof_hashes} hashes",
                     block.txdata.len(),
@@ -795,6 +830,21 @@ impl<S: ChainStore> Node<S> {
         leaf_data: &[CompactLeafData],
         proof: Proof,
     ) -> Result<(), BlockchainError> {
+        // never pending: it yields only when asked to
+        embassy_futures::block_on(self.validate_block(height, block, leaf_data, proof, false))
+    }
+
+    /// [`Node::connect_block`], yielding to the other tasks after each transaction whose scripts
+    /// it checks when `yielding`: a mainnet block's scripts hold a microcontroller's core for
+    /// seconds, which the other connections and a watchdog do not wait out.
+    async fn validate_block(
+        &self,
+        height: u32,
+        block: &Block,
+        leaf_data: &[CompactLeafData],
+        proof: Proof,
+        yielding: bool,
+    ) -> Result<(), BlockchainError> {
         // `ChainState::connect_block` takes the validated tip again and adds its outputs to the
         // accumulator a second time
         let hash = block.block_hash();
@@ -812,11 +862,50 @@ impl<S: ChainStore> Node<S> {
             |h| self.chain.get_block_hash(h),
             |h| self.chain.get_mtp_by_height(h),
         )?;
+        if let Some((verify, rules)) = &self.scripts {
+            let flags = rules.flags(height, Some(&hash));
+            // the block's own transactions by txid, for the outputs it spends in itself
+            let mut in_block: Option<BTreeMap<Txid, usize>> = None;
+            for tx in block.txdata.iter().skip(1) {
+                let mut spent = Vec::with_capacity(tx.input.len());
+                for input in &tx.input {
+                    let prevout = input.previous_output;
+                    let txout = match inputs.get(&prevout) {
+                        Some(utxo) => Some(utxo.txout.clone()),
+                        None => {
+                            let txids = in_block.get_or_insert_with(|| {
+                                block
+                                    .txdata
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, tx)| (tx.compute_txid(), i))
+                                    .collect()
+                            });
+                            txids
+                                .get(&prevout.txid)
+                                .and_then(|i| block.txdata[*i].output.get(prevout.vout as usize))
+                                .cloned()
+                        }
+                    };
+                    spent.push(txout.ok_or(BlockValidationErrors::UtxoNotFound(prevout))?);
+                }
+                if let Err(index) = scripts::check(*verify, tx, &spent, flags) {
+                    return Err(BlockchainError::BlockValidation(
+                        BlockValidationErrors::ScriptValidationError(alloc::format!(
+                            "transaction {} input {index}: script",
+                            tx.compute_txid()
+                        )),
+                    ));
+                }
+                if yielding {
+                    embassy_futures::yield_now().await;
+                }
+            }
+        }
         self.chain.connect_block(block, proof, inputs, del_hashes)?;
         self.mempool.borrow_mut().block_connected(block);
-        // what was asked for or announced against the accumulator before this block
+        // what was asked for against the accumulator before this block
         self.asked.borrow_mut().clear();
-        self.inv_tail.borrow_mut().clear();
         let mut status = self.status.borrow_mut();
         status.last_block = Some(BlockInfo {
             height,
@@ -906,26 +995,19 @@ impl<S: ChainStore> Node<S> {
 
     /// Asks the bridge for the transactions it announces in `list` that the mempool lacks, each
     /// with the positions of the proof hashes that prove the leaves it spends: once synced, with
-    /// a mempool and the room for it. The last transaction of an `inv` waits for the next: its
-    /// positions may go on there (an `inv` holds a limited number of entries). Each transaction
-    /// is asked for once.
+    /// a mempool and the room for it. Each transaction is asked for once.
     async fn ask_transactions<T: Read + Write>(
         &self,
         conn: &mut Connection<T>,
         list: &[Inventory],
     ) -> Result<(), Error<T::Error>> {
-        let mut entries = core::mem::take(&mut *self.inv_tail.borrow_mut());
         if self.config.mempool == 0
             || self.status.borrow().phase != Phase::Following
             || !self.room_for_transactions()
         {
             return Ok(());
         }
-        entries.extend_from_slice(list);
-        if let Some(last) = entries.iter().rposition(|e| e.tx().is_some()) {
-            *self.inv_tail.borrow_mut() = entries.split_off(last);
-        }
-        let wanted = self.wanted(&entries, self.chain.acc().leaves);
+        let wanted = self.wanted(list, self.chain.acc().leaves);
         if !wanted.is_empty() {
             conn.send(&Message::GetData(wanted)).await?;
         }
@@ -1256,18 +1338,24 @@ impl<S: ChainStore> Node<S> {
                         pending::<()>().await;
                     }
                 };
-                let result = select(run, handshake).await;
+                let stale = async {
+                    match role {
+                        Role::Bridge => self.stalled(clock).await,
+                        Role::Peer => pending::<()>().await,
+                    }
+                };
+                let result = select3(run, handshake, stale).await;
                 buffer = conn.into_buffer();
                 if v2 && !keyed.get() {
                     match &result {
-                        Either::First(Err(e)) => debug!("{name} {addr}: no v2 ({e:?}), v1"),
+                        Either3::First(Err(e)) => debug!("{name} {addr}: no v2 ({e:?}), v1"),
                         _ => debug!("{name} {addr}: no v2 handshake in {HANDSHAKE_TIMEOUT} s, v1"),
                     }
                     self.book.borrow_mut().v1_only(addr);
                     continue;
                 }
                 break match result {
-                    Either::First(result) => {
+                    Either3::First(result) => {
                         let ready = self.slot_ready_now(slot);
                         let e = match result {
                             Ok(()) => unreachable!("a connection returns only on an error"),
@@ -1288,15 +1376,42 @@ impl<S: ChainStore> Node<S> {
                         }
                         outcome
                     }
-                    Either::Second(()) => {
+                    Either3::Second(()) => {
                         debug!("{name} {addr}: no handshake in {HANDSHAKE_TIMEOUT} s");
                         Outcome::Unreached
+                    }
+                    Either3::Third(()) => {
+                        warn!(
+                            "{name} {addr}: no block of the best chain in {} min, another bridge",
+                            STALE_BRIDGE / 60
+                        );
+                        Outcome::Behind
                     }
                 };
             };
             self.slot_closed(slot);
             self.book.borrow_mut().release(addr, outcome, clock.now());
             clock.sleep(1).await;
+        }
+    }
+
+    /// Returns once the bridge's connection has validated no block for [`STALE_BRIDGE`] seconds
+    /// while syncing blocks or following, the best header chain ahead of the validated tip.
+    async fn stalled<C: Clock>(&self, clock: &C) {
+        let mut validated = self.chain.get_validation_index().unwrap_or(0);
+        let mut since = clock.now();
+        loop {
+            clock.sleep(STALE_CHECK).await;
+            let now_validated = self.chain.get_validation_index().unwrap_or(0);
+            let best = self.chain.get_best_block().map_or(0, |(h, _)| h);
+            let phase = self.status.borrow().phase;
+            let waiting = matches!(phase, Phase::Blocks | Phase::Following) && now_validated < best;
+            if now_validated != validated || !waiting {
+                validated = now_validated;
+                since = clock.now();
+            } else if clock.now() - since >= STALE_BRIDGE {
+                return;
+            }
         }
     }
 
